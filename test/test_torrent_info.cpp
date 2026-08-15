@@ -606,18 +606,22 @@ TORRENT_TEST(sanitize_path_truncate)
 	using lt::aux::sanitize_append_path_element;
 
 	std::string path;
-	sanitize_append_path_element(path,
+	// no extension in the truncation window: the "no extension" branch
+	bool const modified1 = sanitize_append_path_element(path,
 		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
 		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
 		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
 		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
 		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_");
-	sanitize_append_path_element(path,
+	TEST_EQUAL(modified1, true);
+	// extension found in the truncation window: the extension-preserving branch
+	bool const modified2 = sanitize_append_path_element(path,
 		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
 		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
 		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
 		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
 		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcde.test");
+	TEST_EQUAL(modified2, true);
 	TEST_EQUAL(path,
 		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
 		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
@@ -637,12 +641,17 @@ TORRENT_TEST(sanitize_path_truncate_utf)
 
 	std::string path;
 	// msvc doesn't like unicode string literals, so we encode it as UTF-8 explicitly
-	sanitize_append_path_element(path,
+	bool const modified = sanitize_append_path_element(path,
 		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
 		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
 		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
 		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
-		"abcdefghi_abcdefghi_abcdefghi_abcdefghi" "\xE2" "\x80" "\x94" "abcde.jpg");
+		"abcdefghi_abcdefghi_abcdefghi_abcdefghi"
+		"\xE2"
+		"\x80"
+		"\x94"
+		"abcde.jpg");
+	TEST_EQUAL(modified, true);
 	TEST_EQUAL(path,
 		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
 		"abcdefghi_abcdefghi_abcdefghi_abcdefghi_abcdefghi_"
@@ -665,11 +674,13 @@ TORRENT_TEST(sanitize_path_trailing_dots)
 #endif
 
 	path.clear();
-	sanitize_append_path_element(path, "abc...");
+	bool const modified = sanitize_append_path_element(path, "abc...");
 #ifdef TORRENT_WINDOWS
 	TEST_EQUAL(path, "abc");
+	TEST_EQUAL(modified, true);
 #else
 	TEST_EQUAL(path, "abc...");
+	TEST_EQUAL(modified, false);
 #endif
 
 	path.clear();
@@ -704,11 +715,13 @@ TORRENT_TEST(sanitize_path_trailing_spaces)
 #endif
 
 	path.clear();
-	sanitize_append_path_element(path, "abc   ");
+	bool const modified = sanitize_append_path_element(path, "abc   ");
 #ifdef TORRENT_WINDOWS
 	TEST_EQUAL(path, "abc");
+	TEST_EQUAL(modified, true);
 #else
 	TEST_EQUAL(path, "abc   ");
+	TEST_EQUAL(modified, false);
 #endif
 
 	path.clear();
@@ -1212,6 +1225,64 @@ TORRENT_TEST(sanitize_path_colon)
 #else
 	TEST_EQUAL(path, "foo:bar");
 #endif
+}
+
+// sanitize_append_path_element() returns whether element was modified while
+// being appended to path. torrent_info.cpp relies on this to decide whether
+// a file's name can be borrowed as a string_view into the original buffer
+// (unmodified) or must be copied out of the constructed path (modified).
+TORRENT_TEST(sanitize_path_modified_flag)
+{
+	using lt::aux::sanitize_append_path_element;
+
+	// the common case: a clean element requires no sanitization
+	std::string path;
+	TEST_EQUAL(sanitize_append_path_element(path, "abc"), false);
+	TEST_EQUAL(sanitize_append_path_element(path, "def"), false);
+	TEST_EQUAL(path, "abc" SEPARATOR "def");
+
+	// same, with force_element = true, the mode used for per-file path
+	// components when loading a torrent
+	path.clear();
+	TEST_EQUAL(sanitize_append_path_element(path, "abc", true), false);
+	TEST_EQUAL(sanitize_append_path_element(path, "def", true), false);
+	TEST_EQUAL(path, "abc" SEPARATOR "def");
+
+	// a valid multi-byte utf-8 sequence is not a modification
+	path.clear();
+	TEST_EQUAL(sanitize_append_path_element(path, "filename\xc2\xa1"), false);
+
+	// dots that aren't the entire element are not a modification
+	path.clear();
+	TEST_EQUAL(sanitize_append_path_element(path, "a...b"), false);
+
+	// dropping a filtered character (path separator) is a modification
+	path.clear();
+	TEST_EQUAL(sanitize_append_path_element(path, "/a/"), true);
+
+	// substituting an invalid utf-8 sequence is a modification
+	path.clear();
+	TEST_EQUAL(sanitize_append_path_element(path, "filename\xc2"), true);
+
+	// an empty element is a modification (replaced with "_")
+	path.clear();
+	TEST_EQUAL(sanitize_append_path_element(path, ""), true);
+
+	// a dot-only element is always a modification: dropped entirely when
+	// not forced, replaced with "_" when forced
+	path.clear();
+	TEST_EQUAL(sanitize_append_path_element(path, "..", false), true);
+	TEST_EQUAL(path, "");
+
+	path.clear();
+	TEST_EQUAL(sanitize_append_path_element(path, "..", true), true);
+	TEST_EQUAL(path, "_");
+
+	// a single "." with force_element = false is dropped without touching
+	// path at all, which still counts as a modification
+	path.clear();
+	TEST_EQUAL(sanitize_append_path_element(path, "."), true);
+	TEST_EQUAL(path, "");
 }
 
 TORRENT_TEST(verify_encoding)

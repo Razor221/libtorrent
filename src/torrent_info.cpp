@@ -156,9 +156,12 @@ namespace aux {
 	// meaning in v2 torrents (it means the previous path element was the
 	// filename). Also, If we're adding the torrent name as the first path
 	// element, in a multi-file torrent, we must have a directory name.
-	void sanitize_append_path_element(std::string& path, string_view element, bool const force_element)
+	// returns true if element was modified while being appended to path
+	bool sanitize_append_path_element(
+		std::string& path, string_view element, bool const force_element)
 	{
-		if (element.size() == 1 && element[0] == '.' && !force_element) return;
+		if (element.size() == 1 && element[0] == '.' && !force_element)
+			return true;
 
 #ifdef TORRENT_WINDOWS
 #define TORRENT_SEPARATOR '\\'
@@ -176,8 +179,10 @@ namespace aux {
 		if (element.empty())
 		{
 			path += "_";
-			return;
+			return true;
 		}
+
+		bool modified = false;
 
 #if !TORRENT_USE_UNC_PATHS && defined TORRENT_WINDOWS
 #pragma message ("building for windows without UNC paths is deprecated")
@@ -207,6 +212,7 @@ namespace aux {
 		{
 			pe = "_" + pe;
 			element = string_view();
+			modified = true;
 		}
 #endif
 #ifdef TORRENT_WINDOWS
@@ -221,6 +227,13 @@ namespace aux {
 		char num_dots = 0;
 		bool found_extension = false;
 
+		// [run_start, i) is a span of element that has passed validation and
+		// is pending a single bulk copy into path, rather than being copied
+		// character by character. It's flushed whenever a character needs to
+		// be dropped or substituted, and once at the end of the loop. This
+		// makes the common case, where element needs no sanitization at all,
+		// a single append() call.
+		std::size_t run_start = 0;
 		int seq_len = 0;
 		for (std::size_t i = 0; i < element.size(); i += std::size_t(seq_len))
 		{
@@ -229,27 +242,28 @@ namespace aux {
 
 			if (code_point >= 0 && filter_path_character(code_point))
 			{
+				path.append(element.data() + run_start, i - run_start);
+				run_start = i + std::size_t(seq_len);
+				modified = true;
 				continue;
 			}
 
 			if (code_point < 0 || !valid_path_character(code_point))
 			{
 				// invalid utf8 sequence, replace with "_"
+				path.append(element.data() + run_start, i - run_start);
 				path += '_';
+				run_start = i + std::size_t(seq_len);
 				++added;
+				modified = true;
 #ifdef TORRENT_WINDOWS
 				++unicode_chars;
 #endif
 				continue;
 			}
 
-			// validation passed, add it to the output string
-			for (std::size_t k = i; k < i + std::size_t(seq_len); ++k)
-			{
-				TORRENT_ASSERT(element[k] != 0);
-				path.push_back(element[k]);
-			}
-
+			// validation passed, it stays part of the pending run and is
+			// copied to path in bulk once the run ends
 			if (code_point == '.') ++num_dots;
 
 			added += seq_len;
@@ -267,6 +281,9 @@ namespace aux {
 			if (added >= 240 && !found_extension)
 #endif
 			{
+				path.append(element.data() + run_start, i + std::size_t(seq_len) - run_start);
+				modified = true;
+
 				int dot = -1;
 				for (int j = int(element.size()) - 1;
 					j > std::max(int(element.size()) - 10, int(i)); --j)
@@ -276,12 +293,18 @@ namespace aux {
 					break;
 				}
 				// there is no extension
-				if (dot == -1) break;
+				if (dot == -1)
+				{
+					run_start = element.size();
+					break;
+				}
 				found_extension = true;
 				TORRENT_ASSERT(dot > 0);
 				i = std::size_t(dot - seq_len);
+				run_start = std::size_t(dot);
 			}
 		}
+		path.append(element.data() + run_start, element.size() - run_start);
 
 		if (added == num_dots && added <= 2)
 		{
@@ -296,7 +319,7 @@ namespace aux {
 				// revert everything
 				path.erase(path.end() - added - added_separator, path.end());
 			}
-			return;
+			return true;
 		}
 
 #ifdef TORRENT_WINDOWS
@@ -306,22 +329,29 @@ namespace aux {
 			if (path[i] != ' ' && path[i] != '.') break;
 			path.resize(i);
 			--added;
+			modified = true;
 			TORRENT_ASSERT(added >= 0);
 		}
 
 		if (force_element && added == 0)
 		{
 			path += "_";
+			modified = true;
 		}
 		else if (added == 0 && added_separator)
 		{
 			// remove the separator added at the beginning
 			path.erase(path.end() - 1);
-			return;
+			return true;
 		}
 #endif
 
-		if (path.empty()) path = "_";
+		if (path.empty())
+		{
+			path = "_";
+			modified = true;
+		}
+		return modified;
 	}
 }
 
@@ -506,6 +536,7 @@ namespace {
 
 		std::string path = root_dir;
 		string_view filename;
+		bool modified = false;
 
 		if (top_level)
 		{
@@ -525,7 +556,7 @@ namespace {
 			while (!filename.empty() && filename.front() == TORRENT_SEPARATOR)
 				filename.remove_prefix(1);
 
-			aux::sanitize_append_path_element(path, p.string_value());
+			modified = aux::sanitize_append_path_element(path, filename);
 			if (path.empty())
 			{
 				ec = errors::torrent_missing_name;
@@ -558,8 +589,12 @@ namespace {
 							, static_cast<std::size_t>(e.string_length()) };
 						while (!filename.empty() && filename.front() == TORRENT_SEPARATOR)
 							filename.remove_prefix(1);
+						modified = aux::sanitize_append_path_element(path, filename, true);
 					}
-					aux::sanitize_append_path_element(path, e.string_value(), true);
+					else
+					{
+						aux::sanitize_append_path_element(path, e.string_value(), true);
+					}
 					++idx;
 				}
 			}
@@ -626,10 +661,9 @@ namespace {
 			// directory we haven't parsed yet
 		}
 
-		if (filename.size() > path.length()
-			|| path.substr(path.size() - filename.size()) != filename)
+		if (modified)
 		{
-			// if the filename was sanitized and differ, clear it to just use path
+			// if the filename was sanitized, clear it to just use path
 			filename = {};
 		}
 
@@ -697,14 +731,13 @@ namespace {
 			bool const single_file = leaf_node && !is_multi_file && frame.tree.dict_size() == 1;
 
 			std::string path = single_file ? std::string() : frame.path;
-			aux::sanitize_append_path_element(path, filename, true);
+			bool const modified = aux::sanitize_append_path_element(path, filename, true);
 
 			if (leaf_node)
 			{
-				if (filename.size() > path.length()
-					|| path.substr(path.size() - filename.size()) != filename)
+				if (modified)
 				{
-					// if the filename was sanitized and differ, clear it to just use path
+					// if the filename was sanitized, clear it to just use path
 					filename = {};
 				}
 

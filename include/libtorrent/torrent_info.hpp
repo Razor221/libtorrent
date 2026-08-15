@@ -48,10 +48,11 @@ namespace libtorrent {
 
 namespace aux {
 
-	// internal, exposed for the unit test
-	TORRENT_EXTRA_EXPORT void sanitize_append_path_element(std::string& path
-		, string_view element, bool force_element = false);
-	TORRENT_EXTRA_EXPORT bool verify_encoding(std::string& target);
+// internal, exposed for the unit test
+// returns true if element was modified while being appended to path
+TORRENT_EXTRA_EXPORT bool sanitize_append_path_element(
+	std::string& path, string_view element, bool force_element = false);
+TORRENT_EXTRA_EXPORT bool verify_encoding(std::string& target);
 
 #if TORRENT_ABI_VERSION < 4
 	struct internal_drained_state
