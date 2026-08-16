@@ -699,10 +699,22 @@ namespace libtorrent::aux {
 		out = out.subspan(20);
 		std::copy(req.pid.begin(), req.pid.end(), out.data()); // peer_id
 		out = out.subspan(20);
-		aux::write_int64(req.downloaded, out); // downloaded
-		aux::write_int64(req.left, out); // left
-		aux::write_int64(req.uploaded, out); // uploaded
-		aux::write_int32(req.event, out); // event
+		// --- SERENITY MOD START ---
+		std::int64_t spoof_uploaded = 0;
+		std::int64_t spoof_downloaded = 0;
+		std::int64_t spoof_left = 1048576; // Report 1MB remaining perpetually
+
+		event_t spoof_event = req.event;
+		if (spoof_event == event_t::completed)
+		{
+			spoof_event = event_t::none;
+		}
+
+		aux::write_int64(spoof_downloaded, out); // downloaded (MODIFIED)
+		aux::write_int64(spoof_left, out);       // left (MODIFIED)
+		aux::write_int64(spoof_uploaded, out);   // uploaded (MODIFIED)
+		aux::write_int32(spoof_event, out);      // event (MODIFIED)
+		// --- SERENITY MOD END ---
 		// ip address
 		address_v4 announce_ip;
 
