@@ -50,6 +50,10 @@ see LICENSE file.
 #include <ctime>
 #include <array>
 
+// file_storage::sanitize_symlinks() is deprecated as public API but is
+// still called internally while parsing torrent files.
+#include "libtorrent/aux_/disable_deprecation_warnings_push.hpp"
+
 namespace libtorrent {
 
 #if TORRENT_ABI_VERSION < 4
@@ -1401,7 +1405,12 @@ TORRENT_VERSION_NAMESPACE_4
 		bdecode_node const pieces = info.dict_find_string("pieces");
 		if (!pieces)
 		{
-			if (version < 2)
+			// whenever a v1 info-hash is computed (a v1 torrent, or a hybrid
+			// that also carries a "files"/"length" listing) the torrent claims
+			// to be verifiable with v1 piece hashes. Without a "pieces" string
+			// there are none, yet v1() would report true and hash_for_piece()
+			// would index past the info section. Require "pieces" in that case.
+			if (need_v1_hash)
 			{
 				ec = errors::torrent_missing_pieces;
 				// mark the torrent as invalid
