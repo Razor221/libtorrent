@@ -37,11 +37,17 @@ see LICENSE file.
 
 #include "libtorrent/aux_/merkle.hpp"
 #include "libtorrent/aux_/pe_crypto.hpp"
+#include "libtorrent/aux_/peer_list.hpp"
 #include "libtorrent/aux_/piece_picker.hpp"
+#include "libtorrent/aux_/stat.hpp"
+#include "libtorrent/aux_/torrent_peer.hpp"
+#include "libtorrent/aux_/torrent_peer_allocator.hpp"
 #include "libtorrent/bitfield.hpp"
 #include "libtorrent/hasher.hpp"
 #include "libtorrent/ip_filter.hpp"
 #include "libtorrent/load_torrent.hpp"
+#include "libtorrent/peer_connection_interface.hpp"
+#include "libtorrent/peer_id.hpp"
 #include "libtorrent/performance_counters.hpp"
 #include "libtorrent/sha1_hash.hpp"
 #include "libtorrent/span.hpp"
@@ -171,6 +177,7 @@ namespace pp_bench {
 	using lt::piece_block;
 	using lt::piece_index_t;
 	using lt::typed_bitfield;
+	using lt::aux::ipv4_peer;
 	using lt::aux::piece_picker;
 
 	constexpr int num_pieces = 100000;
@@ -199,6 +206,17 @@ namespace pp_bench {
 	{
 		counters pc;
 		std::vector<piece_index_t> const empty_suggested;
+		lt::tcp::endpoint const endpoint;
+		std::array<ipv4_peer, 8> peers = {{
+			ipv4_peer(endpoint, false, {}),
+			ipv4_peer(endpoint, false, {}),
+			ipv4_peer(endpoint, false, {}),
+			ipv4_peer(endpoint, false, {}),
+			ipv4_peer(endpoint, false, {}),
+			ipv4_peer(endpoint, false, {}),
+			ipv4_peer(endpoint, false, {}),
+			ipv4_peer(endpoint, false, {}),
+		}};
 
 		// picks with the defaults shared by every pick_pieces() benchmark below
 		// (rarest-first, no suggestions, 20 connected peers). `picked` is
@@ -220,6 +238,22 @@ namespace pp_bench {
 				20,
 				pc);
 		};
+		auto const pick_partials = [&](piece_picker const& picker,
+									   typed_bitfield<piece_index_t> const& bits,
+									   int const num_blocks,
+									   std::vector<piece_block>& picked) {
+			picked.clear();
+			picker.pick_pieces(bits,
+				picked,
+				num_blocks,
+				0,
+				nullptr,
+				piece_picker::rarest_first | piece_picker::prioritize_partials,
+				empty_suggested,
+				20,
+				pc);
+			do_not_optimize(picked);
+		};
 
 		// scenario 1: inc_refcount()/dec_refcount() taking a peer's bitfield try
 		// to avoid dirtying the picker by first counting set bits, capped at
@@ -237,14 +271,14 @@ namespace pp_bench {
 				char const* name;
 				int bits_set;
 			};
-			pp_case const cases[] = {
+			std::array<pp_case, 6> const cases{{
 				{"piece picker: refcount bitfield, 1 bit set", 1},
 				{"piece picker: refcount bitfield, 10 bits set", 10},
 				{"piece picker: refcount bitfield, 49 bits set", 49},
 				{"piece picker: refcount bitfield, 50 bits set", 50},
 				{"piece picker: refcount bitfield, 200 bits set", 200},
 				{"piece picker: refcount bitfield, 5000 bits set", 5000},
-			};
+			}};
 			for (auto const& c : cases)
 			{
 				piece_picker p = make_picker();
@@ -399,9 +433,253 @@ namespace pp_bench {
 				do_not_optimize(prios);
 			}));
 		}
+
+		// scenario 8: prioritizing rare partial pieces orders every eligible
+		// partial even when the request can be satisfied by just one or a few of
+		// them. The availability levels repeat to resemble a swarm where many
+		// pieces have the same rank, while still exercising both branches of the
+		// partial-piece comparator.
+		struct partial_case
+		{
+			int count;
+			char const* one_block_name;
+			char const* few_blocks_name;
+			char const* all_blocks_name;
+		};
+		std::array<partial_case, 2> const partial_cases{{
+			{100,
+				"piece picker: rare partials, 100, 1 block",
+				"piece picker: rare partials, 100, 16 blocks",
+				nullptr},
+			{5000,
+				"piece picker: rare partials, 5000, 1 block",
+				"piece picker: rare partials, 5000, 16 blocks",
+				"piece picker: rare partials, 5000, all blocks"},
+		}};
+		for (auto const& c : partial_cases)
+		{
+			piece_picker p = make_picker();
+			for (int i = 0; i < c.count; ++i)
+			{
+				piece_index_t const piece(i);
+				for (int availability = 0; availability <= i % 8; ++availability)
+					p.inc_refcount(piece, &peers[std::size_t(availability)]);
+				p.mark_as_downloading(piece_block(piece, 0), nullptr);
+			}
+
+			typed_bitfield<piece_index_t> const all_pieces(num_pieces, true);
+			std::vector<piece_block> picked;
+
+			results.emplace_back(
+				c.one_block_name, analyze([&] { pick_partials(p, all_pieces, 1, picked); }));
+			results.emplace_back(
+				c.few_blocks_name, analyze([&] { pick_partials(p, all_pieces, 16, picked); }));
+			if (c.all_blocks_name != nullptr)
+			{
+				results.emplace_back(c.all_blocks_name,
+					analyze([&] { pick_partials(p, all_pieces, c.count * 3, picked); }));
+			}
+		}
+
+		// Exercise both sides of the heap/sort crossover with partials at
+		// different completion levels. This catches thresholds based on nominal
+		// piece capacity instead of the blocks that are actually selectable.
+		struct partial_boundary_case
+		{
+			int free_blocks;
+			char const* below_name;
+			char const* at_name;
+			char const* above_name;
+		};
+		std::array<partial_boundary_case, 3> const partial_boundary_cases{{
+			{1,
+				"piece picker: rare partial boundary, 1 free, below",
+				"piece picker: rare partial boundary, 1 free, at",
+				"piece picker: rare partial boundary, 1 free, above"},
+			{2,
+				"piece picker: rare partial boundary, 2 free, below",
+				"piece picker: rare partial boundary, 2 free, at",
+				"piece picker: rare partial boundary, 2 free, above"},
+			{3,
+				"piece picker: rare partial boundary, 3 free, below",
+				"piece picker: rare partial boundary, 3 free, at",
+				"piece picker: rare partial boundary, 3 free, above"},
+		}};
+		for (auto const& c : partial_boundary_cases)
+		{
+			constexpr int partial_count = 1000;
+			piece_picker p = make_picker();
+			for (int i = 0; i < partial_count; ++i)
+			{
+				piece_index_t const piece(i);
+				for (int availability = 0; availability <= i % 8; ++availability)
+					p.inc_refcount(piece, &peers[std::size_t(availability)]);
+				for (int block = 0; block < 4 - c.free_blocks; ++block)
+					p.mark_as_downloading(piece_block(piece, block), nullptr);
+			}
+
+			typed_bitfield<piece_index_t> const all_pieces(num_pieces, true);
+			std::vector<piece_block> picked;
+			int const boundary = partial_count * c.free_blocks / 10;
+			results.emplace_back(
+				c.below_name, analyze([&] { pick_partials(p, all_pieces, boundary - 1, picked); }));
+			results.emplace_back(
+				c.at_name, analyze([&] { pick_partials(p, all_pieces, boundary, picked); }));
+			results.emplace_back(
+				c.above_name, analyze([&] { pick_partials(p, all_pieces, boundary + 1, picked); }));
+		}
 	}
 
 } // namespace pp_bench
+
+// peer_list benchmarks. m_peers is a deque sorted by address, so inserting
+// or erasing a known entry shifts every trailing element and cost scales
+// with list size. A minimal peer_connection_interface stand-in drives
+// connection_closed() and set_connection() without pulling in the real
+// peer_connection machinery.
+namespace pl_bench {
+
+using lt::make_address_v4;
+using lt::aux::peer_list;
+using lt::aux::torrent_peer;
+using lt::aux::torrent_peer_allocator;
+using lt::aux::torrent_state;
+
+constexpr int num_peers = 3000; // matches settings_pack::max_peerlist_size's default
+
+struct bench_peer_connection final : lt::peer_connection_interface
+{
+	explicit bench_peer_connection(lt::tcp::endpoint const& remote)
+		: m_remote(remote)
+	{}
+
+#if TORRENT_USE_I2P
+	std::string const& destination() const override { return m_i2p_dest; }
+	std::string const& local_i2p_endpoint() const override { return m_i2p_dest; }
+#endif
+	lt::tcp::endpoint const& remote() const override { return m_remote; }
+	lt::tcp::endpoint local_endpoint() const override { return {}; }
+	void disconnect(lt::error_code const&, lt::operation_t, lt::disconnect_severity_t) override {}
+	lt::peer_id const& pid() const override { return m_id; }
+	lt::peer_id our_pid() const override { return m_id; }
+	void set_holepunch_mode() override {}
+	torrent_peer* peer_info_struct() const override { return m_tp; }
+	void set_peer_info(torrent_peer* pi) override { m_tp = pi; }
+	bool is_outgoing() const override { return true; }
+	void add_stat(std::int64_t, std::int64_t) override {}
+	bool fast_reconnect() const override { return true; }
+	bool is_choked() const override { return false; }
+	bool failed() const override { return false; }
+	lt::aux::stat const& statistics() const override { return m_stat; }
+	void get_peer_info(lt::peer_info&) const override {}
+#ifndef TORRENT_DISABLE_LOGGING
+	bool should_log(lt::peer_log_alert::direction_t) const override { return false; }
+	void peer_log(lt::peer_log_alert::direction_t,
+		lt::peer_log_alert::event_t,
+		char const*,
+		...) const noexcept override
+	{}
+#endif
+
+	lt::tcp::endpoint m_remote;
+	lt::peer_id m_id{};
+	torrent_peer* m_tp = nullptr;
+	lt::aux::stat m_stat;
+#if TORRENT_USE_I2P
+	std::string m_i2p_dest;
+#endif
+};
+
+// +1 so index 0 doesn't map to the unspecified (0.0.0.0) address, which
+// add_peer() rejects
+lt::tcp::endpoint addr(std::uint32_t const i)
+{
+	return lt::tcp::endpoint(make_address_v4(i + 1), 6881);
+}
+
+torrent_state make_state()
+{
+	torrent_state st;
+	st.max_peerlist_size = 1'000'000; // large enough that add_peer() never evicts
+	st.port = 6881;
+	return st;
+}
+
+void run(std::vector<std::pair<char const*, stats>>& results)
+{
+	static torrent_peer_allocator allocator;
+
+	// scenario 1: add_peer() with no eviction pressure. The list is filled
+	// with every odd address, leaving even addresses free; probe is one of
+	// those free, mid-range addresses. Pairing add with erase keeps the
+	// list size, and so the shift cost, steady across samples.
+	{
+		peer_list p(allocator);
+		torrent_state st = make_state();
+		for (int i = 0; i < num_peers; ++i)
+			p.add_peer(addr(std::uint32_t(2 * i)), {}, {}, &st);
+		st.erased.clear();
+
+		lt::tcp::endpoint const probe = addr(std::uint32_t(num_peers + 1)); // even, mid-range
+		results.emplace_back("peer_list: add peer", analyze([&] {
+			torrent_peer* const tp = p.add_peer(probe, {}, {}, &st);
+			do_not_optimize(tp);
+			p.erase_peer(tp, &st);
+			st.erased.clear();
+		}));
+	}
+
+	// scenario 2: connection_closed() is O(1) on its own. set_connection()
+	// reconnects the peer between samples so each call measures
+	// connection_closed() against the same steady state, rather than
+	// draining the list of connected peers.
+	{
+		peer_list p(allocator);
+		torrent_state st = make_state();
+		for (int i = 0; i < num_peers; ++i)
+			p.add_peer(addr(std::uint32_t(i)), {}, {}, &st);
+		st.erased.clear();
+
+		torrent_peer* const tp = p.connect_one_peer(0, &st);
+		st.erased.clear();
+		bench_peer_connection c(tp->ip());
+		c.set_peer_info(tp);
+		p.set_connection(tp, &c);
+
+		results.emplace_back("peer_list: disconnect peer", analyze([&] {
+			p.connection_closed(c, 0, &st);
+			p.set_connection(tp, &c);
+		}));
+	}
+
+	// scenario 3: evicting peers. erase_peers()'s weeding pass only runs
+	// once the list is full, so adding one more peer to a full list
+	// measures that pass plus the insert it makes room for. Every peer,
+	// including the newly inserted one, is failcount-maxed so each
+	// sample finds the list in the same, fully-evictable state.
+	{
+		peer_list p(allocator);
+		torrent_state st = make_state();
+		st.max_peerlist_size = num_peers;
+		for (int i = 0; i < num_peers; ++i)
+		{
+			torrent_peer* const tp = p.add_peer(addr(std::uint32_t(i)), {}, {}, &st);
+			p.set_failcount(tp, 3);
+		}
+		st.erased.clear();
+
+		std::uint32_t next_addr = num_peers;
+		results.emplace_back("peer_list: evict peers", analyze([&] {
+			torrent_peer* const tp = p.add_peer(addr(next_addr++), {}, {}, &st);
+			do_not_optimize(tp);
+			if (tp != nullptr)
+				p.set_failcount(tp, 3);
+			st.erased.clear();
+		}));
+	}
+}
+
+} // namespace pl_bench
 
 // ip_filter benchmark. access() resolves an address against a std::set of
 // non-overlapping ranges (O(log n) in the number of ranges), so its cost
@@ -604,6 +882,7 @@ try
 	}
 
 	pp_bench::run(results);
+	pl_bench::run(results);
 	ipf_bench::run(results);
 	merkle_bench::run(results);
 

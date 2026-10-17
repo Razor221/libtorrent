@@ -7,15 +7,18 @@ You may use, distribute and modify this code under the terms of the BSD license,
 see LICENSE file.
 */
 
+#include <algorithm>
 #include <iostream>
 #include <thread>
 #include <chrono>
 #include <cstring> // for std::memcmp
+#include <string> // for std::to_string
 #include "test.hpp"
 #include "disk_io_test.hpp"
 #include "setup_transfer.hpp"
 #include "test_utils.hpp"
 #include "libtorrent/disk_interface.hpp"
+#include "libtorrent/disk_observer.hpp"
 #include "libtorrent/session_params.hpp" // for disk_io_constructor_type
 #include "libtorrent/settings_pack.hpp" // for default_settings
 #include "libtorrent/flags.hpp"
@@ -36,6 +39,16 @@ namespace test_mode {
 	using lt::operator ""_bit;
 constexpr disk_test_mode_t v1 = 0_bit;
 constexpr disk_test_mode_t v2 = 1_bit;
+}
+
+namespace {
+
+struct counting_disk_observer final : lt::disk_observer
+{
+	void on_disk() override { ++calls; }
+	int calls = 0;
+};
+
 }
 
 // Create a storage for the already-populated `fs` on `disk`. `fs` must outlive
@@ -220,7 +233,7 @@ static void disk_io_test_suite_impl(lt::disk_io_constructor_type disk_io,
 						v2_hashes,
 						need_v1,
 						need_v2,
-						expected_v2 = std::move(expected_v2),
+						hash_expected_v2 = std::move(expected_v2),
 						expected_v1](lt::piece_index_t,
 						lt::sha1_hash const& v1_hash,
 						lt::storage_error const& e) {
@@ -233,11 +246,12 @@ static void disk_io_test_suite_impl(lt::disk_io_constructor_type disk_io,
 						}
 						if (need_v2)
 						{
-							TEST_EQUAL(v2_hashes->size(), expected_v2.size());
-							for (std::size_t i = 0; i < expected_v2.size(); ++i)
-								TEST_CHECK((*v2_hashes)[i] == expected_v2[i]);
+							TEST_EQUAL(v2_hashes->size(), hash_expected_v2.size());
+							for (std::size_t i = 0; i < hash_expected_v2.size(); ++i)
+								TEST_CHECK((*v2_hashes)[i] == hash_expected_v2[i]);
 						}
-						if (need_v1) TEST_CHECK(v1_hash == expected_v1);
+						if (need_v1)
+							TEST_CHECK(v1_hash == expected_v1);
 						++hashes_done;
 					});
 				++expect_hashes;
@@ -314,13 +328,16 @@ static void disk_io_test_suite(lt::disk_io_constructor_type disk_io,
 
 // Verify that async_hash2 returns the correct SHA-256 for a block that has
 // been written but is still sitting in the disk cache (for pread_disk_io) /
-// store buffer (for mmap_disk_io). With hashing_threads=0 the hasher kick is
-// disabled, so no precomputed v2 block hash is stashed on the storage. With
-// aio_threads=0 there is no thread to flush the cache to disk. In this state
-// any hash2 implementation that falls through to a disk read would read zeros
-// (the block has not been written to disk yet) and produce a wrong hash.
-static void hash2_before_flush_impl(
-	lt::disk_io_constructor_type disk_io, disk_test_mode_t const flags, int const piece_size)
+// store buffer (for mmap_disk_io). With aio_threads=0 there is no thread to
+// flush the cache to disk. In this state any hash2 implementation that falls
+// through to a disk read would read zeros (the block has not been written to
+// disk yet) and produce a wrong hash. With `pad`, file-0 is followed by a pad
+// file, so in a hybrid torrent the block at its end is written with more bytes
+// than its v2 hash covers.
+static void hash2_before_flush_impl(lt::disk_io_constructor_type disk_io,
+	disk_test_mode_t const flags,
+	int const piece_size,
+	bool const pad)
 {
 	lt::io_context ios;
 	lt::counters cnt;
@@ -331,13 +348,21 @@ static void hash2_before_flush_impl(
 
 	std::cout << "hash2_before_flush: " << ((flags & test_mode::v1) ? "v1 " : "")
 			  << ((flags & test_mode::v2) ? "v2 " : "") << " piece_size: " << piece_size
-			  << std::endl;
+			  << (pad ? " pad" : "") << std::endl;
 
 	lt::file_storage fs;
 	fs.set_piece_length(piece_size);
 	int const file_size = piece_size * 3 + 17;
 	fs.add_file("hash2_before_flush_torrent/file-0", file_size, {});
-	fs.set_num_pieces(int((file_size + piece_size - 1) / piece_size));
+	if (pad)
+	{
+		int const pad_size = piece_size - 17;
+		fs.add_file("hash2_before_flush_torrent/.pad/" + std::to_string(pad_size),
+			pad_size,
+			lt::file_storage::flag_pad_file);
+		fs.add_file("hash2_before_flush_torrent/file-1", piece_size, {});
+	}
+	fs.set_num_pieces(int((fs.total_size() + piece_size - 1) / piece_size));
 
 	lt::storage_holder storage = add_test_torrent(*disk_thread,
 		fs,
@@ -382,27 +407,35 @@ static void hash2_before_flush_impl(
 			hh.update({buffer->data() + off, v2_size});
 			lt::sha256_hash const expected = hh.final();
 
-			disk_thread->async_hash2(storage,
-				p,
-				off,
-				lt::disk_job_flags_t{},
-				[&hashes_done, &any_mismatch, expected, p, off](
-					lt::piece_index_t, lt::sha256_hash const& hash, lt::storage_error const& e) {
-					if (e.ec)
-					{
-						std::cout << "ERROR: failed to hash2 (p: " << p << " off: " << off << "): ("
-								  << e.ec.value() << ") " << e.ec.message() << std::endl;
-						std::abort();
-					}
-					if (hash != expected)
-					{
-						std::cout << "MISMATCH at piece " << p << " offset " << off << ": expected "
-								  << expected << " got " << hash << std::endl;
-						any_mismatch = true;
-					}
-					++hashes_done;
-				});
-			++hashes_expected;
+			// pread_disk_io hashes v2 blocks as they are written, and the first
+			// async_hash2() of a block takes that hash. The second call misses
+			// it and hashes the block from the cache.
+			for (int i = 0; i < 2; ++i)
+			{
+				disk_thread->async_hash2(storage,
+					p,
+					off,
+					lt::disk_job_flags_t{},
+					[&hashes_done, &any_mismatch, expected, p, off](lt::piece_index_t,
+						lt::sha256_hash const& hash,
+						lt::storage_error const& e) {
+						if (e.ec)
+						{
+							std::cout << "ERROR: failed to hash2 (p: " << p << " off: " << off
+									  << "): (" << e.ec.value() << ") " << e.ec.message()
+									  << std::endl;
+							std::abort();
+						}
+						if (hash != expected)
+						{
+							std::cout << "MISMATCH at piece " << p << " offset " << off
+									  << ": expected " << expected << " got " << hash << std::endl;
+							any_mismatch = true;
+						}
+						++hashes_done;
+					});
+				++hashes_expected;
+			}
 
 			disk_thread->submit_jobs();
 		}
@@ -449,7 +482,8 @@ static void hash2_before_flush_suite(lt::disk_io_constructor_type disk_io)
 	{
 		for (int piece_size : {0x4000, 0x8000})
 		{
-			hash2_before_flush_impl(disk_io, flags, piece_size);
+			for (bool const pad : {false, true})
+				hash2_before_flush_impl(disk_io, flags, piece_size, pad);
 		}
 	}
 }
@@ -652,10 +686,10 @@ static void unaligned_cross_block_read_impl(
 		}
 		disk_thread->async_read(storage,
 			lt::peer_request{p, start, length},
-			[&reads_done, expected = std::move(expected)](
+			[&reads_done, read_expected = std::move(expected)](
 				lt::disk_buffer_holder b, lt::storage_error const& e) {
 				TEST_CHECK(!e.ec);
-				TEST_CHECK(std::memcmp(b.data(), expected.data(), expected.size()) == 0);
+				TEST_CHECK(std::memcmp(b.data(), read_expected.data(), read_expected.size()) == 0);
 				++reads_done;
 			});
 		++reads_expected;
@@ -855,6 +889,152 @@ TORRENT_TEST_DISK_IO(test_pread_disk_io_fence) { disk_io_test_suite(disk_io, 3, 
 
 TORRENT_TEST_DISK_IO(test_disk_io_hash2_before_flush) { hash2_before_flush_suite(disk_io); }
 
+// a flush pass completes the writes of each piece it flushes, not only the
+// ones of the whole pass when it ends. Each write takes 100 ms under
+// simulate-slow=write, so the pieces written after the first one complete at
+// least 100 ms apart
+TORRENT_TEST(pread_disk_io_flush_completes_each_piece)
+{
+#ifdef TORRENT_SIMULATE_SLOW_WRITE
+	lt::io_context ios;
+	lt::counters cnt;
+	lt::settings_pack sett = lt::default_settings();
+	sett.set_int(lt::settings_pack::aio_threads, 1);
+	std::unique_ptr<lt::disk_interface> disk_thread = lt::pread_disk_io_constructor(ios, sett, cnt);
+
+	int const piece_size = lt::default_block_size;
+	int const num_pieces = 5;
+	lt::file_storage fs;
+	fs.set_piece_length(piece_size);
+	fs.add_file("test-torrent/file", piece_size * num_pieces, {});
+	fs.set_num_pieces(num_pieces);
+	lt::storage_holder storage =
+		add_test_torrent(*disk_thread, fs, "test_flush_completes_each_piece", true, false);
+
+	// generated up front, so that the other pieces are cached while the first
+	// one is written, and a single pass writes them one after the other
+	std::vector<std::vector<char>> buffers;
+	for (lt::piece_index_t const p : fs.piece_range())
+		buffers.push_back(generate_piece(p, piece_size));
+
+	std::vector<std::chrono::steady_clock::time_point> completed(
+		static_cast<std::size_t>(num_pieces));
+	int num_completed = 0;
+	for (lt::piece_index_t const p : fs.piece_range())
+	{
+		auto const i = static_cast<std::size_t>(static_cast<int>(p));
+		disk_thread->async_write(
+			storage,
+			lt::peer_request{p, 0, piece_size},
+			buffers[i].data(),
+			{},
+			[&, i](lt::storage_error const& ec) {
+				TEST_CHECK(!ec);
+				completed[i] = std::chrono::steady_clock::now();
+				++num_completed;
+			},
+			lt::disk_interface::flush_piece);
+	}
+	disk_thread->submit_jobs();
+
+	auto const start_time = lt::aux::time_now();
+	while (num_completed < num_pieces)
+	{
+		ios.run_for(5ms);
+		if (lt::aux::time_now() - start_time > lt::seconds(10))
+		{
+			TEST_ERROR("timeout");
+			break;
+		}
+	}
+	TEST_EQUAL(num_completed, num_pieces);
+
+	auto const first = *std::min_element(completed.begin() + 1, completed.end());
+	auto const last = *std::max_element(completed.begin() + 1, completed.end());
+	TEST_CHECK(last - first >= std::chrono::milliseconds(200));
+
+	disk_thread->abort(true);
+#endif
+}
+
+// with no disk threads, a flush pass runs on the thread that started it, and
+// completing jobs from inside it runs the jobs a fence releases, which can
+// start a nested pass. So the completions of a pass are delivered when it ends.
+// The hash job is not submitted until the writes are posted, so the fence
+// behind it stays up, the writes queue behind the fence, and one pass finds all
+// of them ready
+TORRENT_TEST(pread_disk_io_flush_no_disk_threads)
+{
+#ifdef TORRENT_SIMULATE_SLOW_WRITE
+	lt::io_context ios;
+	lt::counters cnt;
+	lt::settings_pack sett = lt::default_settings();
+	sett.set_int(lt::settings_pack::aio_threads, 0);
+	sett.set_int(lt::settings_pack::hashing_threads, 1);
+	std::unique_ptr<lt::disk_interface> disk_thread = lt::pread_disk_io_constructor(ios, sett, cnt);
+
+	int const piece_size = lt::default_block_size;
+	int const num_pieces = 11;
+	lt::file_storage fs;
+	fs.set_piece_length(piece_size);
+	fs.add_file("test-torrent/file", piece_size * num_pieces, {});
+	fs.set_num_pieces(num_pieces);
+	lt::storage_holder storage =
+		add_test_torrent(*disk_thread, fs, "test_flush_no_disk_threads", true, false);
+
+	std::vector<std::vector<char>> buffers;
+	for (lt::piece_index_t const p : fs.piece_range())
+		buffers.push_back(generate_piece(p, piece_size));
+
+	int fence_jobs_done = 0;
+	disk_thread->async_hash(storage,
+		lt::piece_index_t{0},
+		{},
+		lt::disk_interface::v1_hash,
+		[&](lt::piece_index_t, lt::sha1_hash const&, lt::storage_error const&) {
+			++fence_jobs_done;
+		});
+	disk_thread->async_clear_piece(
+		storage, lt::piece_index_t{0}, [&](lt::piece_index_t) { ++fence_jobs_done; });
+
+	int num_completed = 0;
+	std::int64_t written_at_first_completion = -1;
+	for (lt::piece_index_t const p : fs.piece_range())
+	{
+		if (p == lt::piece_index_t{0})
+			continue;
+		auto const i = static_cast<std::size_t>(static_cast<int>(p));
+		disk_thread->async_write(
+			storage,
+			lt::peer_request{p, 0, piece_size},
+			buffers[i].data(),
+			{},
+			[&](lt::storage_error const& ec) {
+				TEST_CHECK(!ec);
+				if (num_completed++ == 0)
+					written_at_first_completion = cnt[lt::counters::num_blocks_written];
+			},
+			lt::disk_interface::flush_piece);
+	}
+	disk_thread->submit_jobs();
+
+	auto const start_time = lt::aux::time_now();
+	while (num_completed < num_pieces - 1 || fence_jobs_done < 2)
+	{
+		ios.run_for(5ms);
+		if (lt::aux::time_now() - start_time > lt::seconds(20))
+		{
+			TEST_ERROR("timeout");
+			break;
+		}
+	}
+	TEST_EQUAL(num_completed, num_pieces - 1);
+	TEST_EQUAL(written_at_first_completion, num_pieces - 1);
+
+	disk_thread->abort(true);
+#endif
+}
+
 // pread_disk_io only: prepare_read()'s partial_read path and the fence/write-back
 // cache forward-progress the partial_fence case exercises are specific to that
 // backend.
@@ -879,6 +1059,58 @@ TORRENT_TEST(disk_io_partial_read_fence_pread)
 		lt::pread_disk_io_constructor, 0x8000, read_case::partial_fence);
 }
 
+// flushing a piece with missing blocks counts only the blocks that were written
+TORRENT_TEST_DISK_IO(test_disk_io_num_blocks_written)
+{
+	lt::io_context ios;
+	lt::counters cnt;
+	lt::settings_pack sett = lt::default_settings();
+	std::unique_ptr<lt::disk_interface> disk_thread = disk_io(ios, sett, cnt);
+
+	int const piece_size = 4 * lt::default_block_size;
+	lt::file_storage fs;
+	fs.set_piece_length(piece_size);
+	fs.add_file("test-torrent/file", piece_size * 2, {});
+	fs.set_num_pieces(2);
+	lt::storage_holder storage =
+		add_test_torrent(*disk_thread, fs, "test_torrent_store_blocks_written", true, false);
+
+	std::vector<char> const buffer = generate_piece(lt::piece_index_t{0}, piece_size);
+	int writes_done = 0;
+	// blocks 0 and 2 of a four-block piece
+	for (int const block : {0, 2})
+	{
+		lt::peer_request req;
+		req.piece = lt::piece_index_t{0};
+		req.start = block * lt::default_block_size;
+		req.length = lt::default_block_size;
+		disk_thread->async_write(
+			storage, req, buffer.data() + req.start, {}, [&](lt::storage_error const& ec) {
+				TEST_CHECK(!ec);
+				++writes_done;
+			});
+	}
+	// release_files is a fence, the writes are flushed before it runs
+	bool released = false;
+	disk_thread->async_release_files(storage, [&] { released = true; });
+	disk_thread->submit_jobs();
+
+	auto const start_time = lt::aux::time_now();
+	while (!released || writes_done < 2)
+	{
+		ios.run_for(5ms);
+		if (lt::aux::time_now() - start_time > lt::seconds(10))
+		{
+			TEST_ERROR("timeout");
+			break;
+		}
+	}
+	TEST_EQUAL(writes_done, 2);
+	TEST_EQUAL(cnt[lt::counters::num_blocks_written], 2);
+
+	disk_thread->abort(true);
+}
+
 // like test_pread_disk_io_fence, but raises a SECOND, stacked fence in the
 // middle of each piece (after its first block), leaving a partial piece queued
 // between two fences. Exercises forward progress when a stacked fence is
@@ -886,4 +1118,170 @@ TORRENT_TEST(disk_io_partial_read_fence_pread)
 TORRENT_TEST_DISK_IO(test_pread_disk_io_stacked_fence)
 {
 	disk_io_test_suite(disk_io, 3, false, true);
+}
+
+// A storage fence owns writes until it lowers, so they have not reached the
+// disk cache when async_write() returns. They still own receive buffers and
+// must count towards max_queued_disk_bytes just like cached writes do.
+namespace {
+#ifdef TORRENT_SIMULATE_SLOW_WRITE
+void fenced_writes_apply_back_pressure(bool const abort_while_fenced)
+{
+	lt::io_context ios;
+	lt::counters cnt;
+	lt::settings_pack sett = lt::default_settings();
+	sett.set_int(lt::settings_pack::aio_threads, 1);
+	sett.set_int(lt::settings_pack::hashing_threads, 0);
+	sett.set_int(lt::settings_pack::max_queued_disk_bytes, 2 * lt::default_block_size);
+	auto disk_thread = lt::pread_disk_io_constructor(ios, sett, cnt);
+
+	lt::file_storage fs;
+	fs.set_piece_length(lt::default_block_size);
+	fs.add_file("fenced_back_pressure/file", 3 * lt::default_block_size, {});
+	fs.set_num_pieces(3);
+	lt::storage_holder storage =
+		add_test_torrent(*disk_thread, fs, "fenced_back_pressure_store", true, false);
+
+	int clears_done = 0;
+	int writes_done = 0;
+	auto observer = std::make_shared<counting_disk_observer>();
+	std::vector<char> const buffer(std::size_t(lt::default_block_size), 'x');
+	auto const on_write = [&](lt::storage_error const& e) {
+		if (abort_while_fenced && e.ec)
+			TEST_EQUAL(e.ec, lt::error_code(boost::asio::error::operation_aborted));
+		else
+			TEST_CHECK(!e.ec);
+		++writes_done;
+	};
+
+	// Occupy the only disk thread in a slow write. This keeps the clear-piece
+	// fence queued while the second write is synchronously parked behind it.
+	bool const first = disk_thread->async_write(storage,
+		lt::peer_request{0_piece, 0, lt::default_block_size},
+		buffer.data(),
+		observer,
+		on_write,
+		lt::disk_interface::flush_piece);
+	TEST_EQUAL(first, false);
+	disk_thread->submit_jobs();
+
+	auto const write_deadline = lt::aux::time_now() + 10s;
+	while (cnt[lt::counters::num_writing_threads] == 0 && lt::aux::time_now() < write_deadline)
+		std::this_thread::sleep_for(1ms);
+	TEST_CHECK(cnt[lt::counters::num_writing_threads] > 0);
+
+	disk_thread->async_clear_piece(
+		storage, 2_piece, [&clears_done](lt::piece_index_t) { ++clears_done; });
+	bool const second = disk_thread->async_write(storage,
+		lt::peer_request{1_piece, 0, lt::default_block_size},
+		buffer.data(),
+		observer,
+		on_write,
+		lt::disk_interface::flush_piece);
+
+	TEST_EQUAL(second, true);
+	TEST_EQUAL(observer->calls, 0);
+	TEST_CHECK(cnt[lt::counters::blocked_disk_jobs] > 0);
+
+	// A peer can disappear while its write is parked. Back-pressure must not
+	// retain the observer or try to invoke it after destruction.
+	auto expired_observer = std::make_shared<counting_disk_observer>();
+	std::weak_ptr<lt::disk_observer> const weak_observer = expired_observer;
+	TEST_CHECK(disk_thread->async_write(storage,
+		lt::peer_request{2_piece, 0, lt::default_block_size},
+		buffer.data(),
+		expired_observer,
+		on_write,
+		lt::disk_interface::flush_piece));
+	expired_observer.reset();
+	TEST_CHECK(weak_observer.expired());
+
+	disk_thread->submit_jobs();
+	if (abort_while_fenced)
+		disk_thread->abort(true);
+	auto const deadline = lt::aux::time_now() + 20s;
+	while ((clears_done != 1 || writes_done != 3 || observer->calls != 1)
+		&& lt::aux::time_now() < deadline)
+		ios.run_for(5ms);
+
+	TEST_EQUAL(clears_done, 1);
+	TEST_EQUAL(writes_done, 3);
+	TEST_EQUAL(observer->calls, 1);
+	disk_thread->abort(true);
+}
+#endif // TORRENT_SIMULATE_SLOW_WRITE
+}
+
+TORRENT_TEST(pread_fenced_writes_apply_back_pressure)
+{
+#ifdef TORRENT_SIMULATE_SLOW_WRITE
+	fenced_writes_apply_back_pressure(false);
+	fenced_writes_apply_back_pressure(true);
+#endif
+}
+
+// the last block of this piece is all pad and is never written, so the piece
+// is not complete in the cache and its hash reads the pad from disk. The
+// block that was written must still be flushed once the piece is hashed,
+// without a flush_piece flag and without other disk jobs to trigger a flush
+TORRENT_TEST_DISK_IO(test_disk_io_flush_after_hash_with_pad)
+{
+	lt::io_context ios;
+	lt::counters cnt;
+	lt::settings_pack sett = lt::default_settings();
+	sett.set_int(lt::settings_pack::hashing_threads, 1);
+	sett.set_int(lt::settings_pack::aio_threads, 1);
+	std::unique_ptr<lt::disk_interface> disk_thread = disk_io(ios, sett, cnt);
+
+	int const piece_size = 2 * lt::default_block_size;
+	int const file_size = lt::default_block_size - 100;
+	lt::file_storage fs;
+	fs.set_piece_length(piece_size);
+	fs.add_file("test-torrent/file-0", file_size, {});
+	fs.add_file("test-torrent/.pad/16484", piece_size - file_size, lt::file_storage::flag_pad_file);
+	fs.add_file("test-torrent/file-1", piece_size, {});
+	fs.set_num_pieces(2);
+	lt::storage_holder storage =
+		add_test_torrent(*disk_thread, fs, "test_torrent_store_pad", true, false);
+
+	lt::piece_index_t const piece{0};
+	std::vector<char> buffer = generate_piece(piece, piece_size);
+	std::fill(buffer.begin() + file_size, buffer.end(), char(0));
+
+	int writes_done = 0;
+	disk_thread->async_write(storage,
+		lt::peer_request{piece, 0, lt::default_block_size},
+		buffer.data(),
+		{},
+		[&](lt::storage_error const& ec) {
+			TEST_CHECK(!ec);
+			++writes_done;
+		});
+
+	bool hashed = false;
+	disk_thread->async_hash(storage,
+		piece,
+		{},
+		lt::disk_interface::v1_hash,
+		[&](lt::piece_index_t, lt::sha1_hash const& h, lt::storage_error const& ec) {
+			TEST_CHECK(!ec);
+			TEST_CHECK(h == lt::hasher(buffer).final());
+			hashed = true;
+		});
+	disk_thread->submit_jobs();
+
+	auto const start_time = lt::aux::time_now();
+	while (!hashed || writes_done < 1)
+	{
+		ios.run_for(5ms);
+		if (lt::aux::time_now() - start_time > lt::seconds(10))
+		{
+			TEST_ERROR("timeout");
+			break;
+		}
+	}
+	TEST_CHECK(hashed);
+	TEST_EQUAL(writes_done, 1);
+
+	disk_thread->abort(true);
 }
