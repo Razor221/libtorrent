@@ -114,6 +114,18 @@ namespace libtorrent::aux {
 		{
 			static aux::array<const char*, 4> const event_string{{{"completed", "started", "stopped", "paused"}}};
 
+			// --- SERENITY MOD START ---
+			std::int64_t spoof_uploaded = 0;
+			std::int64_t spoof_downloaded = 0;
+			std::int64_t spoof_left = 1048576; // Report 1MB remaining perpetually
+
+			event_t spoof_event = tracker_req().event;
+			if (spoof_event == event_t::completed)
+			{
+				spoof_event = event_t::none;
+			}
+			// --- SERENITY MOD END ---        
+
 			char str[1024];
 			std::snprintf(str, sizeof(str)
 				, "&peer_id=%s"
@@ -131,13 +143,13 @@ namespace libtorrent::aux {
 				// the i2p tracker seems to verify that the port is not 0,
 				// even though it ignores it otherwise
 				, tracker_req().listen_port
-				, tracker_req().uploaded
-				, tracker_req().downloaded
-				, tracker_req().left
+				, spoof_uploaded      // MODIFIED
+				, spoof_downloaded    // MODIFIED
+				, spoof_left          // MODIFIED
 				, tracker_req().corrupt
 				, tracker_req().key
-				, (tracker_req().event != event_t::none) ? "&event=" : ""
-				, (tracker_req().event != event_t::none) ? event_string[static_cast<int>(tracker_req().event) - 1] : ""
+				, (spoof_event != event_t::none) ? "&event=" : ""                      // MODIFIED
+				, (spoof_event != event_t::none) ? event_string[static_cast<int>(spoof_event) - 1] : ""  // MODIFIED
 				, tracker_req().num_want);
 			url += str;
 #if !defined TORRENT_DISABLE_ENCRYPTION
