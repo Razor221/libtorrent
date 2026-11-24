@@ -69,6 +69,7 @@ see LICENSE file.
 #include "libtorrent/kademlia/node_entry.hpp"
 #endif
 #include "libtorrent/aux_/enum_net.hpp"
+#include "libtorrent/aux_/escape_string.hpp" // for is_valid_i2p_destination
 #include "libtorrent/upnp.hpp"
 #include "libtorrent/natpmp.hpp"
 #include "libtorrent/aux_/lsd.hpp"
@@ -2361,7 +2362,7 @@ retry:
 		// it was disabled at. This change would affect the ABI in 1.2, so
 		// should be done in 2.0 or later
 		for (auto& t : m_torrents)
-			t->enable_all_trackers();
+			t->on_listen_sockets_changed();
 	}
 
 	void session_impl::reopen_network_sockets(reopen_network_flags_t const options)
@@ -2475,6 +2476,10 @@ retry:
 
 	void session_impl::on_i2p_open(error_code const& ec)
 	{
+		// the SAM session was closed or replaced
+		if (ec == boost::asio::error::operation_aborted)
+			return;
+
 		if (ec)
 		{
 			if (m_alerts.should_post<i2p_alert>())
@@ -2537,7 +2542,20 @@ retry:
 #endif
 			return;
 		}
-		incoming_connection(std::move(*m_i2p_listen_socket));
+
+		// reject before a peer_connection exists, so an invalid destination
+		// cannot trigger the torrent's connection limit eviction
+		if (!is_valid_i2p_destination(std::get<i2p_stream>(*m_i2p_listen_socket).destination()))
+		{
+#ifndef TORRENT_DISABLE_LOGGING
+			if (should_log())
+				session_log(" <== INCOMING CONNECTION [ rejected, invalid i2p destination ]");
+#endif
+		}
+		else
+		{
+			incoming_connection(std::move(*m_i2p_listen_socket));
+		}
 		m_i2p_listen_socket.reset();
 		open_new_incoming_i2p_connection();
 	}
@@ -4257,10 +4275,13 @@ retry:
 				, [](torrent const* lhs, torrent const* rhs)
 				{ return lhs->sequence_number() < rhs->sequence_number(); });
 
-			std::partial_sort(seeds.begin(), seeds.begin() +
-				std::min(hard_limit, int(seeds.size())), seeds.end()
-				, [this](torrent const* lhs, torrent const* rhs)
-				{ return lhs->seed_rank(m_settings) > rhs->seed_rank(m_settings); });
+			time_point32 const now = aux::time_now32();
+			std::partial_sort(seeds.begin(),
+				seeds.begin() + std::min(hard_limit, int(seeds.size())),
+				seeds.end(),
+				[this, now](torrent const* lhs, torrent const* rhs) {
+					return lhs->seed_rank(m_settings, now) > rhs->seed_rank(m_settings, now);
+				});
 		}
 
 		auto_manage_checking_torrents(checking, checking_limit);
@@ -5260,17 +5281,28 @@ retry:
 		}
 
 #ifndef TORRENT_DISABLE_DHT
-		// add params.dht_nodes to the DHT, if enabled
-		for (auto const& n : params.dht_nodes)
-			add_dht_node_name(n);
+#if TORRENT_USE_I2P
+		// pinging nodes supplied by the torrent's creator would reveal our
+		// IP to them, deanonymizing us for an i2p torrent
+		bool const skip_dht_nodes = !m_settings.get_bool(settings_pack::allow_i2p_mixed)
+			&& ((params.flags & torrent_flags::i2p_torrent) || (params.ti && params.ti->is_i2p()));
+#else
+		bool const skip_dht_nodes = false;
+#endif
+		if (!skip_dht_nodes)
+		{
+			// add params.dht_nodes to the DHT, if enabled
+			for (auto const& n : params.dht_nodes)
+				add_dht_node_name(n);
 
 #if TORRENT_ABI_VERSION < 4
-		if (params.ti)
-		{
-			for (auto const& n : params.ti->nodes())
-				add_dht_node_name(n);
-		}
+			if (params.ti)
+			{
+				for (auto const& n : params.ti->nodes())
+					add_dht_node_name(n);
+			}
 #endif
+		}
 #endif
 
 		INVARIANT_CHECK;
@@ -7477,6 +7509,8 @@ retry:
 		int unchokes_all = 0;
 		int num_optimistic = 0;
 		int disk_queue[2] = {0, 0};
+		int peers_up_requests = 0;
+		int peers_down_requests = 0;
 		for (auto const& p : m_connections)
 		{
 			TORRENT_ASSERT(p);
@@ -7488,6 +7522,11 @@ retry:
 
 			if (p->m_channel_state[0] & peer_info::bw_disk) ++disk_queue[0];
 			if (p->m_channel_state[1] & peer_info::bw_disk) ++disk_queue[1];
+
+			if (!p->upload_queue().empty())
+				++peers_up_requests;
+			if (!p->download_queue().empty())
+				++peers_down_requests;
 
 			if (p->ignore_unchoke_slots())
 			{
@@ -7510,6 +7549,11 @@ retry:
 
 		for (auto const& p : m_undead_peers)
 		{
+			// disconnected peers have released their requests and stopped
+			// contributing to the request gauges
+			TORRENT_ASSERT(p->upload_queue().empty());
+			TORRENT_ASSERT(p->download_queue().empty());
+
 			if (p->ignore_unchoke_slots())
 			{
 				if (!p->is_choked()) ++unchokes_all;
@@ -7533,6 +7577,11 @@ retry:
 			== m_stats_counters[counters::num_peers_down_disk]);
 		TORRENT_ASSERT(disk_queue[peer_connection::upload_channel]
 			== m_stats_counters[counters::num_peers_up_disk]);
+		TORRENT_ASSERT_VAL(peers_up_requests == m_stats_counters[counters::num_peers_up_requests],
+			peers_up_requests);
+		TORRENT_ASSERT_VAL(
+			peers_down_requests == m_stats_counters[counters::num_peers_down_requests],
+			peers_down_requests);
 
 		if (m_settings.get_int(settings_pack::num_optimistic_unchoke_slots))
 		{

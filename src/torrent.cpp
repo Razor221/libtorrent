@@ -121,6 +121,17 @@ using namespace std::placeholders;
 namespace libtorrent::aux {
 namespace {
 
+// the scrape counters are 24-bit fields, where all bits set means unknown.
+// the public API uses -1 for unknown
+constexpr std::uint32_t unknown_scrape = 0xffffff;
+
+std::uint32_t to_scrape_field(int const v)
+{
+	return (v < 0 || v >= int(unknown_scrape)) ? unknown_scrape : std::uint32_t(v);
+}
+
+int from_scrape_field(std::uint32_t const v) { return v == unknown_scrape ? -1 : int(v); }
+
 bool is_downloading_state(int const st)
 {
 	switch (st)
@@ -192,10 +203,10 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 		peer_info.web_seed = true;
 	}
 
-	torrent_hot_members::torrent_hot_members(aux::session_interface& ses
-		, add_torrent_params const& p, bool const session_paused)
+	torrent_hot_members::torrent_hot_members(
+		aux::session_interface& ses, add_torrent_params const& p, bool const session_paused)
 		: m_ses(ses)
-		, m_complete(0xffffff)
+		, m_complete(to_scrape_field(p.num_complete))
 		, m_upload_mode(bool(p.flags & torrent_flags::upload_mode))
 		, m_connections_initialized(false)
 		, m_abort(false)
@@ -261,7 +272,7 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 #endif
 		, m_connect_boost_counter(
 			  static_cast<std::uint8_t>(settings().get_int(settings_pack::torrent_connect_boost)))
-		, m_incomplete(0xffffff)
+		, m_incomplete(to_scrape_field(p.num_incomplete))
 		, m_announce_to_dht(!(p.flags & torrent_flags::paused))
 		, m_ssl_torrent(false)
 		, m_deleted(false)
@@ -272,7 +283,7 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 		, m_current_gauge_state(static_cast<std::uint32_t>(no_gauge_state))
 		, m_moving_storage(false)
 		, m_inactive(false)
-		, m_downloaded(0xffffff)
+		, m_downloaded(to_scrape_field(p.num_downloaded))
 		, m_progress_ppm(0)
 		, m_torrent_initialized(false)
 		, m_outstanding_file_priority(false)
@@ -1241,6 +1252,7 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 			// unlock the piece and restore it, as if no block was
 			// ever downloaded for it.
 			m_picker->restore_piece(piece);
+			mark_queued_blocks_downloading(piece, {});
 		}
 
 		update_gauge();
@@ -2779,9 +2791,16 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 
 			// if the v1 hash failed the check, don't add the v2 hashes to the
 			// merkle tree. They are most likely invalid.
-			if (torrent_file().info_hashes().has_v2() && !bool(hash_passed[0] == false))
+			// Unless the piece hash is already known, then nothing is stored on
+			// failure. A v2 pass means the v1 and v2 hashes are inconsistent,
+			// which is an error, not a missing piece
+			if (torrent_file().info_hashes().has_v2())
 			{
-				hash_passed[1] = on_blocks_hashed(piece, block_hashes);
+				need_hash_picker();
+				if (!bool(hash_passed[0] == false) || get_hash_picker().have_hash(piece))
+				{
+					hash_passed[1] = on_blocks_hashed(piece, block_hashes);
+				}
 			}
 		}
 		else
@@ -3147,6 +3166,18 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 #if TORRENT_USE_I2P
 		if (!i2p_compatible_tracker(ae))
 			return false;
+#endif
+#if TORRENT_USE_RTC
+		if (aux::is_websocket_tracker_url(ae.url))
+		{
+			if (!rtc_allowed())
+				return false;
+#if TORRENT_USE_I2P
+			// WebRTC can't be carried over i2p
+			if (ae.i2p)
+				return false;
+#endif
+		}
 #endif
 		return aux::is_tracker_protocol_supported(ae.url);
 	}
@@ -3819,19 +3850,28 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 			}
 		}
 
-		if ((complete >= 0 && int(m_complete) != complete)
-			|| (incomplete >= 0 && int(m_incomplete) != incomplete)
-			|| (downloaded >= 0 && int(m_downloaded) != downloaded))
-			state_updated();
-
-		if (int(m_complete) != complete
-			|| int(m_incomplete) != incomplete
-			|| int(m_downloaded) != downloaded)
+		// a field no tracker knows about must not clobber a known value, such
+		// as one restored from resume data
+		bool changed = false;
+		if (complete >= 0 && m_complete != to_scrape_field(complete))
 		{
-			m_complete = std::uint32_t(complete);
-			m_incomplete = std::uint32_t(incomplete);
-			m_downloaded = std::uint32_t(downloaded);
+			m_complete = to_scrape_field(complete);
+			changed = true;
+		}
+		if (incomplete >= 0 && m_incomplete != to_scrape_field(incomplete))
+		{
+			m_incomplete = to_scrape_field(incomplete);
+			changed = true;
+		}
+		if (downloaded >= 0 && m_downloaded != to_scrape_field(downloaded))
+		{
+			m_downloaded = to_scrape_field(downloaded);
+			changed = true;
+		}
 
+		if (changed)
+		{
+			state_updated();
 			update_auto_sequential();
 
 			// these numbers are cached in the resume data
@@ -3936,6 +3976,11 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 		TORRENT_UNUSED(tracker_ips);
 #endif
 
+		pex_flags_t flags = v == protocol_version::V2 ? pex_lt_v2 : pex_flags_t(0);
+		// a v2-only torrent has no v1 info hash to connect with
+		if (!torrent_file().info_hashes().has_v1())
+			flags |= pex_lt_v2;
+
 		// for each of the peers we got from the tracker
 		for (auto const& i : resp.peers)
 		{
@@ -3951,9 +3996,10 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 				if (string_ends_with(i.hostname, ".i2p"))
 				{
 					ADD_OUTSTANDING_ASYNC("torrent::on_i2p_resolve");
-					r.i2pconn->async_name_lookup(i.hostname.c_str()
-						, [self = shared_from_this()] (error_code const& ec, char const* dest)
-						{ self->torrent::on_i2p_resolve(ec, dest, peer_info::tracker); });
+					r.i2pconn->async_name_lookup(i.hostname.c_str(),
+						[self = shared_from_this(), flags](error_code const& ec, char const* dest) {
+							self->torrent::on_i2p_resolve(ec, dest, peer_info::tracker, flags);
+						});
 				}
 				else
 				{
@@ -3962,7 +4008,7 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 					// that in the i2p_peer object directly
 					torrent_state st = get_peer_list_state();
 					need_peer_list();
-					if (m_peer_list->add_i2p_peer(i.hostname, peer_info::tracker, {}, &st))
+					if (m_peer_list->add_i2p_peer(i.hostname, peer_info::tracker, flags, &st))
 						state_updated();
 					peers_erased(st.erased);
 				}
@@ -3996,7 +4042,7 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 		{
 			for (auto const& i : resp.i2p_peers)
 			{
-				add_i2p_peer(i.destination, peer_info::tracker);
+				add_i2p_peer(i.destination, peer_info::tracker, flags);
 			}
 		}
 #endif
@@ -4009,8 +4055,6 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 		// 2. it might make sense to have a tracker extension in the future where
 		//    trackers records a peer's internal and external IP, and match up
 		//    peers on the same local network
-
-		pex_flags_t flags = v == protocol_version::V2 ? pex_lt_v2 : pex_flags_t(0);
 
 		bool need_update = false;
 		for (auto const& i : resp.peers4)
@@ -4294,25 +4338,32 @@ namespace {
 #endif
 
 #if TORRENT_USE_I2P
-	void torrent::add_i2p_peer(sha256_hash const& dest, peer_source_flags_t const source)
+	void torrent::add_i2p_peer(
+		sha256_hash const& dest, peer_source_flags_t const source, pex_flags_t const flags)
 	{
 		// TODO: store i2p addresses as a 32 byte sha256 hash in the
 		// i2p_peer object, rather than resolving it into the full vase64
 		// destination. We should keep the full destination as a cache in the
 		// i2p_peer object still.
+
+		// i2p_connection queues lookups until the SAM session is up
+		if (settings().get_str(settings_pack::i2p_hostname).empty())
+			return;
 		i2p_connection& i2pconn = session().i2p_conn();
-		if (!i2pconn.is_open()) return;
 
 		std::string destination = base32encode_i2p(dest);
 		destination += ".b32.i2p";
 
 		ADD_OUTSTANDING_ASYNC("torrent::on_i2p_resolve");
-		i2pconn.async_name_lookup(destination.c_str()
-			, [self = shared_from_this(), source] (error_code const& ec, char const* d)
-			{ self->torrent::on_i2p_resolve(ec, d, source); });
+		i2pconn.async_name_lookup(destination.c_str(),
+			[self = shared_from_this(), source, flags](error_code const& ec, char const* d) {
+				self->torrent::on_i2p_resolve(ec, d, source, flags);
+			});
 	}
 
-	void torrent::on_i2p_resolve(error_code const& ec, char const* dest, peer_source_flags_t const source) try
+	void torrent::on_i2p_resolve(
+		error_code const& ec, char const* dest, peer_source_flags_t const source, pex_flags_t flags)
+	try
 	{
 		TORRENT_ASSERT(is_single_thread());
 
@@ -4325,9 +4376,12 @@ namespace {
 #endif
 		if (ec || m_abort || m_ses.is_aborted()) return;
 
+		// a v2-only torrent has no v1 info hash to connect with
+		if (!torrent_file().info_hashes().has_v1())
+			flags |= pex_lt_v2;
 		need_peer_list();
 		torrent_state st = get_peer_list_state();
-		if (m_peer_list->add_i2p_peer(dest, source, {}, &st))
+		if (m_peer_list->add_i2p_peer(dest, source, flags, &st))
 			state_updated();
 		peers_erased(st.erased);
 
@@ -5200,8 +5254,14 @@ namespace {
 				{
 					peer_id const pid = p->connection
 						? p->connection->pid() : peer_id();
-					m_ses.alerts().emplace_alert<peer_ban_alert>(
-						get_handle(), p->ip(), pid);
+#if TORRENT_USE_I2P
+					peer_endpoint_t const ep = p->is_i2p_addr
+						? peer_endpoint_t(i2p_destination_hash(p->dest()))
+						: peer_endpoint_t(p->ip());
+#else
+					peer_endpoint_t const ep = p->ip();
+#endif
+					m_ses.alerts().emplace_alert<peer_ban_alert>(get_handle(), ep, pid);
 				}
 
 				// mark the peer as banned
@@ -5262,8 +5322,16 @@ namespace {
 		// and mark it as being interesting for download
 		TORRENT_ASSERT(!m_picker->have_piece(piece));
 
-		// loop over all peers and re-request potential duplicate
-		// blocks to this piece
+		mark_queued_blocks_downloading(piece, blocks);
+	}
+	catch (...)
+	{
+		handle_exception();
+	}
+
+	void torrent::mark_queued_blocks_downloading(
+		piece_index_t const piece, span<int const> const blocks)
+	{
 		for (auto* p : m_connections)
 		{
 			TORRENT_INCREMENT(m_iterating_connections);
@@ -5288,7 +5356,6 @@ namespace {
 			}
 		}
 	}
-	catch (...) { handle_exception(); }
 
 	void torrent::peer_has(piece_index_t const index, peer_connection const* peer)
 	{
@@ -6569,6 +6636,12 @@ namespace {
 	void torrent::generate_rtc_offers(int const count
 		, std::function<void(error_code const&, std::vector<aux::rtc_offer>)> handler)
 	{
+		if (!rtc_allowed())
+		{
+			handler(boost::asio::error::operation_not_supported, {});
+			return;
+		}
+
 		// rtc_signaling is created lazily
 		if (!m_rtc_signaling)
 		{
@@ -6581,14 +6654,29 @@ namespace {
 		m_rtc_signaling->generate_offers(count, std::move(handler));
 	}
 
+	bool torrent::rtc_allowed() const
+	{
+		if (!aux::webrtc_allowed(settings()))
+			return false;
+#if TORRENT_USE_I2P
+		if (is_i2p() && !settings().get_bool(settings_pack::allow_i2p_mixed))
+			return false;
+#endif
+		return true;
+	}
+
 	void torrent::on_rtc_offer(aux::rtc_offer const& offer)
 	{
+		if (!rtc_allowed())
+			return;
 		TORRENT_ASSERT(m_rtc_signaling);
 		if(m_rtc_signaling) m_rtc_signaling->process_offer(offer);
 	}
 
 	void torrent::on_rtc_answer(aux::rtc_answer const& answer)
 	{
+		if (!rtc_allowed())
+			return;
 		TORRENT_ASSERT(m_rtc_signaling);
 		if(m_rtc_signaling) m_rtc_signaling->process_answer(answer);
 	}
@@ -6605,6 +6693,17 @@ namespace {
 #ifndef TORRENT_DISABLE_LOGGING
 			debug_log("failed to get RTC stream remote endpoint: %s", ec.message().c_str());
 #endif
+			return;
+		}
+
+		// WebRTC peers don't pass through incoming_connection(), attach_peer()
+		// or add_peer(), so the IP filter has to be applied here
+		if (m_apply_ip_filter && m_ip_filter
+			&& m_ip_filter->access(endpoint.address()) & ip_filter::blocked)
+		{
+			if (alerts().should_post<peer_blocked_alert>())
+				alerts().emplace_alert<peer_blocked_alert>(
+					get_handle(), endpoint, peer_blocked_alert::ip_filter);
 			return;
 		}
 
@@ -7547,8 +7646,13 @@ namespace {
 		return ret;
 	}
 
-	void torrent::enable_all_trackers()
+	void torrent::on_listen_sockets_changed()
 	{
+		// announce_with_tracker() only refreshes the trackers it reaches.
+		// Endpoints of closed listen sockets left on the others would make
+		// update_tracker_timer() schedule announces that are never sent
+		for (aux::announce_entry& ae : m_trackers)
+			refresh_endpoint_list(m_ses, is_ssl_torrent(), bool(m_complete_sent), ae);
 		m_trackers.enable_all();
 	}
 
@@ -7567,9 +7671,9 @@ namespace {
 		ret.last_upload = aux::to_time_t(m_last_upload);
 		ret.last_download = aux::to_time_t(m_last_download);
 
-		ret.num_complete = m_complete;
-		ret.num_incomplete = m_incomplete;
-		ret.num_downloaded = m_downloaded;
+		ret.num_complete = from_scrape_field(m_complete);
+		ret.num_incomplete = from_scrape_field(m_incomplete);
+		ret.num_downloaded = from_scrape_field(m_downloaded);
 
 		ret.flags = this->flags();
 
@@ -8017,6 +8121,12 @@ namespace {
 
 	bool torrent::connect_to_peer(torrent_peer* peerinfo, bool const ignore_limit)
 	{
+		return connect_to_peer(peerinfo, peerinfo->ip(), ignore_limit);
+	}
+
+	bool torrent::connect_to_peer(
+		torrent_peer* peerinfo, tcp::endpoint const& target, bool const ignore_limit)
+	{
 		TORRENT_ASSERT(is_single_thread());
 		INVARIANT_CHECK;
 		TORRENT_UNUSED(ignore_limit);
@@ -8044,10 +8154,9 @@ namespace {
 		)
 		{
 			// this asserts that we don't have duplicates in the peer_list's peer list
-			peer_iterator i_ = std::find_if(m_connections.begin(), m_connections.end()
-				, [peerinfo] (peer_connection const* p)
-				{
-					return !p->is_disconnecting() && p->remote() == peerinfo->ip();
+			peer_iterator i_ = std::find_if(
+				m_connections.begin(), m_connections.end(), [&target](peer_connection const* p) {
+					return !p->is_disconnecting() && p->remote() == target;
 				});
 
 			TORRENT_ASSERT(i_ == m_connections.end()
@@ -8059,7 +8168,7 @@ namespace {
 		TORRENT_ASSERT(m_ses.num_connections()
 			< settings().get_int(settings_pack::connections_limit) || ignore_limit);
 
-		tcp::endpoint a(peerinfo->ip());
+		TORRENT_ASSERT(target.address() == peerinfo->address());
 		TORRENT_ASSERT(!m_apply_ip_filter
 			|| !m_ip_filter
 			|| (m_ip_filter->access(peerinfo->address()) & ip_filter::blocked) == 0);
@@ -8164,7 +8273,7 @@ namespace {
 		}
 		}();
 
-		if(!create_peer_connection(peerinfo, std::move(s), std::move(a)))
+		if (!create_peer_connection(peerinfo, std::move(s), target))
 			return false;
 
 		return peerinfo->connection != nullptr;
@@ -8635,11 +8744,11 @@ namespace {
 #ifndef TORRENT_DISABLE_LOGGING
 			if (should_log())
 			{
-				debug_log("CLOSING CONNECTION \"%s\" peer list full "
-					"connections: %d limit: %d"
-					, print_endpoint(p->remote()).c_str()
-					, num_peers()
-					, m_max_connections);
+				debug_log("CLOSING CONNECTION \"%s\" rejected by peer list "
+						  "connections: %d limit: %d",
+					print_endpoint(p->remote()).c_str(),
+					num_peers(),
+					m_max_connections);
 			}
 #endif
 			p->disconnect(errors::too_many_connections, operation_t::bittorrent);
@@ -10044,15 +10153,15 @@ namespace {
 	}
 
 	// the higher seed rank, the more important to seed
-	int torrent::seed_rank(aux::session_settings const& s) const
+	int torrent::seed_rank(aux::session_settings const& s, time_point32 const now) const
 	{
 		TORRENT_ASSERT(is_single_thread());
 		enum flags
 		{
 			seed_ratio_not_met = 0x40000000,
-			no_seeds           = 0x20000000,
-			recently_started   = 0x10000000,
-			prio_mask          = 0x0fffffff
+			recently_started = 0x20000000,
+			no_seeds = 0x10000000,
+			prio_mask = 0x0fffffff
 		};
 
 		if (!is_finished()) return 0;
@@ -10062,7 +10171,6 @@ namespace {
 
 		int ret = 0;
 
-		time_point32 const now = aux::time_now32();
 		seconds32 const act_time = active_time(now);
 		seconds32 const fin_time = finished_time(now);
 		seconds32 const download_time = act_time - fin_time;
@@ -10071,16 +10179,21 @@ namespace {
 		// flag. That will make this seed prioritized
 		// downloaded may be 0 if the torrent is 0-sized
 		std::int64_t const downloaded = std::max(m_total_downloaded, m_torrent_file->total_size());
+		// the seed time limit may be set high enough for the product to
+		// overflow 32 bits
 		if (fin_time < seconds(s.get_int(settings_pack::seed_time_limit))
 			&& (download_time.count() > 1
-				&& fin_time * 100 / download_time < s.get_int(settings_pack::seed_time_ratio_limit))
+				&& std::int64_t(fin_time.count()) * 100 / download_time.count()
+					< s.get_int(settings_pack::seed_time_ratio_limit))
 			&& downloaded > 0
 			&& m_total_uploaded * 100 / downloaded < s.get_int(settings_pack::share_ratio_limit))
 			ret |= seed_ratio_not_met;
 
-		// if this torrent is running, and it was started less
-		// than 30 minutes ago, give it priority, to avoid oscillation
-		if (!is_paused() && act_time < minutes(30))
+		// a torrent resumed less than 30 minutes ago keeps its slot, to avoid
+		// oscillation and to give it time to be classified as inactive (see
+		// dont_count_slow_torrents). This outranks no_seeds, since queued
+		// torrents without scrape data look like they have no seeds
+		if (!is_paused() && m_active_timer.live_for(now) < minutes(30))
 			ret |= recently_started;
 
 		// if we have any scrape data, use it to calculate
@@ -10105,7 +10218,10 @@ namespace {
 		}
 		else
 		{
-			ret |= ((1 + downloaders) * scale / seeds) & prio_mask;
+			// the scrape counters are 24 bits wide, so the product does not
+			// fit in an int
+			ret |= int(
+				std::min(std::int64_t(prio_mask), (1 + std::int64_t(downloaders)) * scale / seeds));
 		}
 
 		return ret;
@@ -10385,9 +10501,19 @@ namespace {
 		, web_seed_entry::headers_t const& extra_headers
 		, web_seed_flag_t const flags)
 	{
+		return add_web_seed_redirect(url, auth, extra_headers, flags, 0);
+	}
+
+	web_seed_t* torrent::add_web_seed_redirect(std::string const& url,
+		std::string const& auth,
+		web_seed_entry::headers_t const& extra_headers,
+		web_seed_flag_t const flags,
+		int const redirect_depth)
+	{
 		web_seed_t ent(url, auth, extra_headers);
 		ent.ephemeral = bool(flags & ephemeral);
 		ent.no_local_ips = bool(flags & no_local_ips);
+		ent.redirect_depth = std::uint8_t(redirect_depth);
 
 		// don't add duplicates
 		auto const it = std::find(m_web_seeds.begin(), m_web_seeds.end(), ent);
@@ -10405,7 +10531,7 @@ namespace {
 		m_web_seeds.emplace_back(std::move(ent));
 
 		// ephemeral web seeds are not saved in the resume data
-		if (!ent.ephemeral)
+		if (!m_web_seeds.back().ephemeral)
 			set_need_save_resume(torrent_handle::if_metadata_changed);
 
 		update_want_tick();
@@ -10657,22 +10783,22 @@ namespace {
 
 					if (t.tier > state.tier)
 					{
-						if (!announce_to_all_tiers) break;
+						// only stop at a higher tier once this one has a
+						// working tracker, the same as announce_with_tracker()
+						if (!announce_to_all_tiers && state.found_working)
+							continue;
 						state.found_working = false;
 					}
 					state.tier = t.tier;
 					if (a.fails >= t.fail_limit && t.fail_limit != 0) continue;
-					if (a.updating)
+					if (!a.updating && a.next_announce != time_point32::min())
 					{
-						state.found_working = true;
-					}
-					else if (a.next_announce != time_point32::min())
-					{
-						// defensive: announce_with_tracker() always
-						// advances next_announce for trackers it would
-						// actually contact, so a leftover min() means
-						// something filtered this tracker upstream. Don't let
-						// it snap the timer to "now" and re-fire endlessly.
+						// min() means either an endpoint that has not been
+						// announced on yet (e.g. created for a new listen
+						// socket) or a tracker announce_with_tracker()
+						// filtered out. The latter would never advance
+						// next_announce, so letting min() snap the timer to
+						// "now" would re-fire it endlessly.
 						time_point32 const next_tracker_announce = std::max(a.next_announce, a.min_announce);
 						if (next_tracker_announce < next_announce)
 							next_announce = next_tracker_announce;
@@ -11031,6 +11157,12 @@ namespace {
 			return;
 		}
 
+#if TORRENT_USE_I2P
+		// web seeds don't support i2p
+		if (is_i2p() && !settings().get_bool(settings_pack::allow_i2p_mixed))
+			return;
+#endif
+
 		// when set to unlimited, use 100 as the limit
 		int limit = zero_or(settings().get_int(settings_pack::max_web_seed_connections)
 			, 100);
@@ -11043,6 +11175,12 @@ namespace {
 		{
 			auto const w = i++;
 			if (w->disabled || w->removed || w->retry > now || !w->interesting)
+				continue;
+
+			// this web seed has redirected all its files to other URLs. We
+			// won't connect to it again, and it's not supposed to keep the
+			// web seeds it redirected to from being connected
+			if (!w->have_files.empty() && w->have_files.none_set())
 				continue;
 
 			--limit;
@@ -11991,14 +12129,25 @@ namespace {
 		return m_peer_list->find_peers(a);
 	}
 
-	void torrent::update_peer_port(int const port, torrent_peer* p
-		, peer_source_flags_t const src)
+	bool torrent::update_peer_port(int const port, torrent_peer* p, peer_source_flags_t const src)
 	{
+		// the port comes from the peer itself. It's held to the same rules as
+		// the port of a peer we learn about some other way (see add_peer())
+		if (port <= 0 || port > 65535)
+			return false;
+
+		if (m_ses.get_port_filter().access(std::uint16_t(port)) & port_filter::blocked)
+			return false;
+
+		if (settings().get_bool(settings_pack::no_connect_privileged_ports) && port < 1024)
+			return false;
+
 		need_peer_list();
 		torrent_state st = get_peer_list_state();
 		m_peer_list->update_peer_port(port, p, src, &st);
 		peers_erased(st.erased);
 		update_want_peers();
+		return true;
 	}
 
 	// verify piece is used when checking resume data or when the user
@@ -12546,7 +12695,7 @@ namespace {
 		st->list_seeds = m_peer_list ? m_peer_list->num_seeds() : 0;
 		st->connect_candidates = m_peer_list ? m_peer_list->num_connect_candidates() : 0;
 		TORRENT_ASSERT(st->connect_candidates >= 0);
-		st->seed_rank = seed_rank(settings());
+		st->seed_rank = seed_rank(settings(), now);
 
 		st->all_time_upload = m_total_uploaded;
 		st->all_time_download = m_total_downloaded;
@@ -12574,8 +12723,8 @@ namespace {
 
 		st->storage_mode = static_cast<storage_mode_t>(m_storage_mode);
 
-		st->num_complete = (m_complete == 0xffffff) ? -1 : m_complete;
-		st->num_incomplete = (m_incomplete == 0xffffff) ? -1 : m_incomplete;
+		st->num_complete = from_scrape_field(m_complete);
+		st->num_incomplete = from_scrape_field(m_incomplete);
 #if TORRENT_ABI_VERSION == 1
 		st->paused = is_torrent_paused();
 		st->auto_managed = m_auto_managed;

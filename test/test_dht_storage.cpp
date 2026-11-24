@@ -416,6 +416,26 @@ TORRENT_TEST(mutable_item_limit)
 	TEST_EQUAL(cnt.mutable_data, 42);
 }
 
+TORRENT_TEST(item_limit_zero)
+{
+	// with no room for items, a put must not evict from an empty table
+	auto sett = test_settings();
+	sett.set_int(settings_pack::dht_max_dht_items, 0);
+	std::unique_ptr<dht_storage_interface> s(create_default_dht_storage(sett));
+
+	public_key pk;
+	signature sig;
+	for (int i = 0; i < 2; ++i)
+	{
+		s->put_immutable_item(rand_hash(), {"123", 3}, rand_v4());
+		s->put_mutable_item(
+			rand_hash(), {"123", 3}, sig, sequence_number(1), pk, {"salt", 4}, rand_v4());
+	}
+	dht_storage_counters cnt = s->counters();
+	TEST_EQUAL(cnt.immutable_data, 1);
+	TEST_EQUAL(cnt.mutable_data, 1);
+}
+
 TORRENT_TEST(get_peers_dist)
 {
 	// test that get_peers returns reasonably disjoint sets of peers with each call
@@ -463,6 +483,32 @@ TORRENT_TEST(get_peers_dist)
 		s->get_peers(n1, true, false, address(), peers);
 		TEST_EQUAL(peers["values"].list().size(), 100);
 	}
+}
+
+TORRENT_TEST(get_peers_uniform)
+{
+	// picking 1 peer out of 2, each peer should be picked half the time
+	auto sett = test_settings();
+	sett.set_int(settings_pack::dht_max_peers_reply, 1);
+	std::unique_ptr<dht_storage_interface> s(create_default_dht_storage(sett));
+
+	address const peer_addr = rand_v4();
+	s->announce_peer(n1, tcp::endpoint(peer_addr, 0), "torrent_name", false);
+	s->announce_peer(n1, tcp::endpoint(peer_addr, 1), "torrent_name", false);
+
+	int first = 0;
+	for (int i = 0; i < 10000; ++i)
+	{
+		entry peers;
+		s->get_peers(n1, false, false, address(), peers);
+		TEST_EQUAL(peers["values"].list().size(), 1);
+		auto const& p = peers["values"].list().front();
+		if (aux::read_v4_endpoint<tcp::endpoint>(p.string().begin()).port() == 0)
+			++first;
+	}
+	std::printf("first peer picked: %d\n", first);
+	TEST_CHECK(first > 4500);
+	TEST_CHECK(first < 5500);
 }
 
 TORRENT_TEST(update_node_ids)
@@ -585,6 +631,31 @@ TORRENT_TEST(infohashes_sample_dist)
 	}
 	std::printf("infohashes set size: %d\n", int(infohash_set.size()));
 	TEST_CHECK(infohash_set.size() > 500);
+}
+
+TORRENT_TEST(infohashes_sample_uniform)
+{
+	// sampling 1 info-hash out of 2, each should be sampled half the time
+	auto sett = test_settings();
+	sett.set_int(settings_pack::dht_sample_infohashes_interval, 0);
+	sett.set_int(settings_pack::dht_max_infohashes_sample_count, 1);
+	std::unique_ptr<dht_storage_interface> s(create_default_dht_storage(sett));
+
+	s->announce_peer(n1, ep("124.31.75.21", 1), "torrent_name1", false);
+	s->announce_peer(n2, ep("124.31.75.22", 1), "torrent_name2", false);
+
+	int first = 0;
+	for (int i = 0; i < 10000; ++i)
+	{
+		entry item;
+		int const r = s->get_infohashes_sample(item);
+		TEST_EQUAL(r, 1);
+		if (sha1_hash(item["samples"].string()) == n1)
+			++first;
+	}
+	std::printf("first info-hash sampled: %d\n", first);
+	TEST_CHECK(first > 4500);
+	TEST_CHECK(first < 5500);
 }
 #else
 TORRENT_TEST(dummy) {}

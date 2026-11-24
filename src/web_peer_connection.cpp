@@ -20,6 +20,7 @@ see LICENSE file.
 #include <cstdio> // for snprintf
 #include <cinttypes> // for PRId64 et.al.
 #include <limits>
+#include <tuple>
 
 #include "libtorrent/aux_/web_peer_connection.hpp"
 #include "libtorrent/session.hpp"
@@ -40,7 +41,26 @@ see LICENSE file.
 
 namespace libtorrent::aux {
 
+// redirects to URLs longer than this are rejected
+constexpr std::size_t max_redirect_url_size = 4096;
+
 constexpr int request_size_overhead = 5000;
+
+// the max number of consecutive redirects we follow from a web seed. It's the
+// same limit http_connection uses, for tracker requests
+constexpr int max_redirect_depth = 5;
+
+// sanity limit on the size of a single HTTP request (possibly consisting of
+// multiple GETs) sent to a web seed
+constexpr int max_request_size = 16 * 1024 * 1024;
+
+// approximate size of one GET in a request, excluding the URL and file path.
+// Covers the request line and headers
+constexpr int get_request_overhead = 200;
+
+// a piece is only worth requesting from a web seed if the payload is at least
+// this many times larger than the request for it
+constexpr int min_payload_request_ratio = 4;
 
 std::string escape_file_path(file_storage const& storage, file_index_t index);
 
@@ -118,17 +138,63 @@ std::string escape_file_path(file_storage const& storage, file_index_t index)
 	return escape_path(new_path);
 }
 
+// the request for a piece has one GET per file it spans, each carrying the
+// URL and file path. Pieces whose request would rival the payload in size are
+// not worth requesting, clear them from the pieces the web seed is considered
+// to have. Files are ordered by offset, so a running total for the current
+// piece is enough. Pieces are judged by the nominal piece length so that a
+// short last piece is not penalized
+void clear_expensive_pieces(
+	file_storage const& fs, int const url_size, typed_bitfield<piece_index_t>& have)
+{
+	std::int64_t const max_request_size_per_piece = fs.piece_length() / min_payload_request_ratio;
+
+	auto const check = [&](piece_index_t const piece, std::int64_t const request_size) {
+		if (request_size > max_request_size_per_piece)
+			have.clear_bit(piece);
+	};
+
+	piece_index_t cur(0);
+	std::int64_t request_size = 0;
+	for (auto const i : fs.file_range())
+	{
+		if (fs.pad_file_at(i) || fs.file_size(i) == 0)
+			continue;
+
+		auto const range = aux::file_piece_range_inclusive(fs, i);
+		piece_index_t const first = range._begin;
+		piece_index_t const last = prev(range._end);
+
+		std::int64_t const get_size =
+			url_size + get_request_overhead + std::int64_t(fs.file_path(i).size());
+
+		if (first != cur)
+		{
+			check(cur, request_size);
+			cur = first;
+			request_size = 0;
+		}
+		request_size += get_size;
+
+		// pieces strictly inside the file hold a single file. The file also
+		// counts towards the piece it ends in
+		if (last != first)
+		{
+			check(cur, request_size);
+			cur = last;
+			request_size = get_size;
+		}
+	}
+	check(cur, request_size);
+}
+
 void web_peer_connection::on_connected()
 {
 	peer_id pid;
 	aux::random_bytes(pid);
 	set_pid(pid);
 
-	if (m_web->have_files.empty())
-	{
-		incoming_have_all();
-	}
-	else if (m_web->have_files.none_set())
+	if (!m_web->have_files.empty() && m_web->have_files.none_set())
 	{
 		incoming_have_none();
 		m_web->interesting = false;
@@ -150,26 +216,44 @@ void web_peer_connection::on_connected()
 		typed_bitfield<piece_index_t> have;
 		file_storage const& fs = t->torrent_file().layout();
 		have.resize(fs.num_pieces(), true);
-		for (auto const i : fs.file_range())
+		if (!m_web->have_files.empty())
 		{
-			// if we have the file, no need to do anything
-			if (m_web->have_files.get_bit(i) || fs.pad_file_at(i)) continue;
+			for (auto const i : fs.file_range())
+			{
+				// if we have the file, no need to do anything
+				if (m_web->have_files.get_bit(i) || fs.pad_file_at(i))
+					continue;
 
-			for (piece_index_t const k : aux::file_piece_range_inclusive(fs, i))
-				have.clear_bit(k);
+				for (piece_index_t const k : aux::file_piece_range_inclusive(fs, i))
+					have.clear_bit(k);
+			}
 		}
-		t->set_seed(peer_info_struct(), false);
-		if (have.none_set())
+		// requests are built from the original file paths, renames don't
+		// affect what is sent to the web seed
+		aux::clear_expensive_pieces(t->torrent_file().layout(), int(m_url.size()), have);
+
+		if (have.all_set())
 		{
-			incoming_have_none();
-			m_web->interesting = false;
-#ifndef TORRENT_DISABLE_LOGGING
-			peer_log(peer_log_alert::info, peer_log_alert::web_seed, "have no pieces, not interesting. %s", m_url.c_str());
-#endif
+			incoming_have_all();
 		}
 		else
 		{
-			incoming_bitfield(have);
+			t->set_seed(peer_info_struct(), false);
+			if (have.none_set())
+			{
+				incoming_have_none();
+				m_web->interesting = false;
+#ifndef TORRENT_DISABLE_LOGGING
+				peer_log(peer_log_alert::info,
+					peer_log_alert::web_seed,
+					"have no pieces, not interesting. %s",
+					m_url.c_str());
+#endif
+			}
+			else
+			{
+				incoming_bitfield(have);
+			}
 		}
 	}
 
@@ -493,6 +577,22 @@ void web_peer_connection::write_request(peer_request const& r)
 			TORRENT_ASSERT(f.file_index >= file_index_t(0));
 
 			m_file_requests.push_back(file_req);
+
+			// each file the request spans adds a GET, with the full URL. A
+			// request this web seed can only serve with an unreasonably large
+			// number of them is not worth building
+			if (request.size() > std::size_t(max_request_size))
+			{
+#ifndef TORRENT_DISABLE_LOGGING
+				peer_log(peer_log_alert::info,
+					peer_log_alert::web_seed,
+					"request too large: %" PRId64 " bytes, files: %d",
+					std::int64_t(request.size()),
+					int(m_file_requests.size()));
+#endif
+				disable(errors::packet_too_large);
+				return;
+			}
 		}
 	}
 
@@ -661,6 +761,27 @@ void web_peer_connection::handle_redirect(int const bytes_left)
 		return;
 	}
 
+	// every redirect to a new URL adds a web seed to the torrent. Don't follow
+	// redirects indefinitely
+	if (m_web->redirect_depth >= max_redirect_depth)
+	{
+		disable(errors::invalid_redirection);
+		return;
+	}
+
+	location = aux::resolve_redirect_location(m_url, location);
+
+	// work-around for buggy HTTP servers, that fail to encode the redirect URL
+	location = maybe_url_encode(location);
+	if (location.size() > max_redirect_url_size)
+	{
+		disable(errors::invalid_redirection);
+		return;
+	}
+#ifndef TORRENT_DISABLE_LOGGING
+	peer_log(peer_log_alert::info, peer_log_alert::location, "%s", location.c_str());
+#endif
+
 	bool const single_file_request = !m_path.empty()
 		&& m_path[m_path.size() - 1] != '/';
 
@@ -682,13 +803,6 @@ void web_peer_connection::handle_redirect(int const bytes_left)
 		}
 		file_index_t const file_index = m_file_requests.front().file_index;
 
-		location = aux::resolve_redirect_location(m_url, location);
-
-		// work-around for buggy HTTP servers, that fail to encode the redirect URL
-		location = maybe_url_encode(location);
-#ifndef TORRENT_DISABLE_LOGGING
-		peer_log(peer_log_alert::info, peer_log_alert::location, "%s", location.c_str());
-#endif
 		// TODO: 3 this could be made more efficient for the case when we use an
 		// HTTP proxy. Then we wouldn't need to add new web seeds to the torrent,
 		// we could just make the redirect table contain full URLs.
@@ -719,7 +833,8 @@ void web_peer_connection::handle_redirect(int const bytes_left)
 		// with base url=="http://example2.com/" and redirects[0]=="/subpath/file2").
 		// If we try to load resume with such "web_seed_t" then "web_peer_connection" will send
 		// request with wrong path "http://example2.com/file1" (cause "redirects" map is not serialized in resume)
-		web_seed_t* web = t->add_web_seed(redirect_base, auth, m_extra_headers, web_seed_flags);
+		web_seed_t* web = t->add_web_seed_redirect(
+			redirect_base, auth, m_extra_headers, web_seed_flags, m_web->redirect_depth + 1);
 		web->have_files.resize(t->torrent_file().num_files(), false);
 
 		// the new web seed we're adding only has this file for now
@@ -759,20 +874,14 @@ void web_peer_connection::handle_redirect(int const bytes_left)
 	}
 	else
 	{
-		location = aux::resolve_redirect_location(m_url, location);
-
-		// work-around for buggy HTTP servers, that fail to encode the redirect URL
-		location = maybe_url_encode(location);
-#ifndef TORRENT_DISABLE_LOGGING
-		peer_log(peer_log_alert::info, peer_log_alert::location, "%s", location.c_str());
-#endif
 		// Don't forward our credentials (the web_seed_entry::auth value, sent
 		// as the Authorization header) to a different origin. The redirect
 		// target may be a third party server that should not see them. Note
 		// that any user-supplied m_extra_headers are still forwarded -- see the
 		// warning on web_seed_entry::extra_headers.
 		std::string const auth = same_origin(m_url, location) ? m_external_auth : std::string();
-		t->add_web_seed(location, auth, m_extra_headers, web_seed_flags);
+		t->add_web_seed_redirect(
+			location, auth, m_extra_headers, web_seed_flags, m_web->redirect_depth + 1);
 
 		// this web seed doesn't have any files. Don't try to request from it
 		// again this session
@@ -860,7 +969,6 @@ void web_peer_connection::on_receive(error_code const& error
 			}
 
 			TORRENT_ASSERT(recv_buffer.empty() || recv_buffer[0] == 'H');
-			TORRENT_ASSERT(int(recv_buffer.size()) <= m_recv_buffer.packet_size());
 
 			// this means the entire status line hasn't been received yet
 			if (m_parser.status_code() == -1)

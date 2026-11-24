@@ -19,6 +19,7 @@ see LICENSE file.
 #include <vector>
 #include <functional>
 #include <cstdint>
+#include <limits>
 
 #include "libtorrent/aux_/disable_warnings_push.hpp"
 #include <boost/logic/tribool.hpp>
@@ -456,8 +457,11 @@ namespace {
 
 		if (t && t->alerts().should_post<peer_connect_alert>())
 		{
-			t->alerts().emplace_alert<peer_connect_alert>(
-				t->get_handle(), remote(), pid(), socket_type_idx(m_socket), peer_connect_alert::direction_t::out);
+			t->alerts().emplace_alert<peer_connect_alert>(t->get_handle(),
+				remote_endpoint(),
+				pid(),
+				socket_type_idx(m_socket),
+				peer_connect_alert::direction_t::out);
 		}
 #ifndef TORRENT_DISABLE_LOGGING
 		if (should_log(peer_log_alert::info))
@@ -1195,9 +1199,7 @@ namespace {
 #if TORRENT_USE_I2P
 		if (auto s = std::get_if<i2p_stream>(&m_socket))
 		{
-			// TODO: store the sah256 hash of the destination in the
-			// i2p_peer struct, so we don't have to recompute it every time
-			return hasher256(base64decode_i2p(s->destination())).final();
+			return i2p_destination_hash(s->destination());
 		}
 #endif
 		return m_remote;
@@ -1563,6 +1565,8 @@ namespace {
 		auto t = m_torrent.lock();
 		piece_picker& picker = t->picker();
 		aux::torrent_peer* self_peer = peer_info_struct();
+		if (!m_download_queue.empty())
+			m_counters.inc_stats_counter(counters::num_peers_down_requests, -1);
 		while (!m_download_queue.empty())
 		{
 			pending_block& qe = m_download_queue.back();
@@ -2866,8 +2870,11 @@ namespace {
 		{
 			if (t->alerts().should_post<peer_error_alert>())
 			{
-				t->alerts().emplace_alert<peer_error_alert>(t->get_handle(), m_remote
-					, m_peer_id, operation_t::bittorrent, errors::peer_sent_empty_piece);
+				t->alerts().emplace_alert<peer_error_alert>(t->get_handle(),
+					remote_endpoint(),
+					m_peer_id,
+					operation_t::bittorrent,
+					errors::peer_sent_empty_piece);
 			}
 			// This is used as a reject-request by bitcomet
 			incoming_reject_request(p);
@@ -2908,9 +2915,11 @@ namespace {
 		{
 			if (t->alerts().should_post<unwanted_block_alert>())
 			{
-				t->alerts().emplace_alert<unwanted_block_alert>(t->get_handle()
-					, m_remote, m_peer_id, block_finished.block_index
-					, block_finished.piece_index);
+				t->alerts().emplace_alert<unwanted_block_alert>(t->get_handle(),
+					remote_endpoint(),
+					m_peer_id,
+					block_finished.block_index,
+					block_finished.piece_index);
 			}
 #ifndef TORRENT_DISABLE_LOGGING
 			peer_log(peer_log_alert::info, peer_log_alert::invalid_request, "The block we just got was not in the request queue");
@@ -2983,8 +2992,8 @@ namespace {
 			m_snubbed = false;
 			if (t->alerts().should_post<peer_unsnubbed_alert>())
 			{
-				t->alerts().emplace_alert<peer_unsnubbed_alert>(t->get_handle()
-					, m_remote, m_peer_id);
+				t->alerts().emplace_alert<peer_unsnubbed_alert>(
+					t->get_handle(), remote_endpoint(), m_peer_id);
 			}
 		}
 
@@ -3282,8 +3291,10 @@ namespace {
 		if (t->alerts().should_post<block_finished_alert>())
 		{
 			t->alerts().emplace_alert<block_finished_alert>(t->get_handle(),
-				remote(), pid(), block_finished.block_index
-				, block_finished.piece_index);
+				remote_endpoint(),
+				pid(),
+				block_finished.block_index,
+				block_finished.piece_index);
 		}
 
 		disconnect_if_redundant();
@@ -3552,6 +3563,19 @@ namespace {
 				return;
 		}
 
+		// the peer decides how many pieces it allows us to request while
+		// choked, but there's a limit to how many of them we keep track of
+		if (int(m_allowed_fast.size()) >= 30)
+		{
+#ifndef TORRENT_DISABLE_LOGGING
+			peer_log(peer_log_alert::incoming_message,
+				peer_log_alert::invalid_allowed_fast,
+				"%d (too many pieces)",
+				static_cast<int>(index));
+#endif
+			return;
+		}
+
 		// if we don't have the metadata, we'll verify
 		// this piece index later
 		m_allowed_fast.push_back(index);
@@ -3706,8 +3730,8 @@ namespace {
 
 		if (t->alerts().should_post<block_downloading_alert>())
 		{
-			t->alerts().emplace_alert<block_downloading_alert>(t->get_handle()
-				, remote(), pid(), block.block_index, block.piece_index);
+			t->alerts().emplace_alert<block_downloading_alert>(
+				t->get_handle(), remote_endpoint(), pid(), block.block_index, block.piece_index);
 		}
 
 		pending_block pb(block);
@@ -4494,14 +4518,18 @@ namespace {
 			if ((error > failure || ec.category() == socks_category())
 				&& alerts.should_post<peer_error_alert>())
 			{
-				alerts.emplace_alert<peer_error_alert>(handle, remote()
-					, pid(), op, ec);
+				alerts.emplace_alert<peer_error_alert>(handle, remote_endpoint(), pid(), op, ec);
 			}
 
 			if (error <= failure && alerts.should_post<peer_disconnected_alert>())
 			{
-				alerts.emplace_alert<peer_disconnected_alert>(handle
-					, remote(), pid(), op, socket_type_idx(m_socket), ec, close_reason);
+				alerts.emplace_alert<peer_disconnected_alert>(handle,
+					remote_endpoint(),
+					pid(),
+					op,
+					socket_type_idx(m_socket),
+					ec,
+					close_reason);
 			}
 		}
 
@@ -4520,6 +4548,12 @@ namespace {
 				}
 			}
 
+			if (!m_requests.empty())
+			{
+				m_counters.inc_stats_counter(counters::num_peers_up_requests, -1);
+				m_requests.clear();
+			}
+
 			if (t->has_picker())
 			{
 				clear_download_queue();
@@ -4534,7 +4568,11 @@ namespace {
 			}
 			else
 			{
-				m_download_queue.clear();
+				if (!m_download_queue.empty())
+				{
+					m_counters.inc_stats_counter(counters::num_peers_down_requests, -1);
+					m_download_queue.clear();
+				}
 				m_request_queue.clear();
 				m_outstanding_bytes = 0;
 			}
@@ -4560,6 +4598,7 @@ namespace {
 		{
 			TORRENT_ASSERT(m_download_queue.empty());
 			TORRENT_ASSERT(m_request_queue.empty());
+			TORRENT_ASSERT(m_requests.empty());
 			m_ses.close_connection(this);
 		}
 
@@ -5191,8 +5230,8 @@ namespace {
 			m_slow_start = false;
 			if (t->alerts().should_post<peer_snubbed_alert>())
 			{
-				t->alerts().emplace_alert<peer_snubbed_alert>(t->get_handle()
-					, m_remote, m_peer_id);
+				t->alerts().emplace_alert<peer_snubbed_alert>(
+					t->get_handle(), remote_endpoint(), m_peer_id);
 			}
 		}
 		m_desired_queue_size = 1;
@@ -5247,9 +5286,11 @@ namespace {
 
 			if (t->alerts().should_post<block_timeout_alert>())
 			{
-				t->alerts().emplace_alert<block_timeout_alert>(t->get_handle()
-					, remote(), pid(), qe.block.block_index
-					, qe.block.piece_index);
+				t->alerts().emplace_alert<block_timeout_alert>(t->get_handle(),
+					remote_endpoint(),
+					pid(),
+					qe.block.block_index,
+					qe.block.piece_index);
 			}
 
 			// request a new block before removing the previous
@@ -5326,8 +5367,10 @@ namespace {
 #ifndef TORRENT_DISABLE_LOGGING
 			peer_log(peer_log_alert::info, peer_log_alert::torrent_aborted);
 #endif
+			TORRENT_ASSERT(!m_requests.empty());
 			for (peer_request const& r : m_requests)
 				write_reject_request(r);
+			m_counters.inc_stats_counter(counters::num_peers_up_requests, -1);
 			m_requests.clear();
 			return;
 		}
@@ -6063,7 +6106,8 @@ namespace {
 		int const quota_left = m_quota[download_channel];
 		int const max_receive = std::min(buffer_size, quota_left);
 
-		if (max_receive == 0) return;
+		if (max_receive <= 0)
+			return;
 
 		span<char> const vec = m_recv_buffer.reserve(max_receive);
 		TORRENT_ASSERT(!(m_channel_state[download_channel] & peer_info::bw_network));
@@ -6099,6 +6143,15 @@ namespace {
 	void peer_connection::send_buffer(span<char const> buf)
 	{
 		TORRENT_ASSERT(is_single_thread());
+
+		// the send buffer tracks sizes as int. This buffer, the current
+		// capacity and the minimum 128 byte allocation below must all fit
+		if (std::int64_t(buf.size()) + m_send_buffer.capacity() + 128
+			> std::numeric_limits<int>::max())
+		{
+			disconnect(errors::packet_too_large, operation_t::alloc_sndbuf, failure);
+			return;
+		}
 
 		int const free_space = std::min(
 			m_send_buffer.space_in_last_buffer(), int(buf.size()));
@@ -6234,6 +6287,11 @@ namespace {
 				, "%d bytes", buffer_size);
 #endif
 
+			// the buffer is full, so reserve() grows it by buffer_size
+			buffer_size = std::min(buffer_size,
+				m_settings.get_int(settings_pack::max_peer_recv_buffer_size)
+					- m_recv_buffer.capacity());
+
 			request_bandwidth(download_channel, buffer_size);
 
 			int const quota_left = m_quota[download_channel];
@@ -6292,7 +6350,7 @@ namespace {
 			? 100 : 0;
 		m_recv_buffer.normalize(force_shrink);
 
-		if (m_recv_buffer.max_receive() == 0)
+		if (m_recv_buffer.max_receive() <= 0)
 		{
 			// the message we're receiving is larger than our receive
 			// buffer, we must grow.
@@ -6303,6 +6361,15 @@ namespace {
 			peer_log(peer_log_alert::incoming, peer_log_alert::grow_buffer, "%d bytes"
 				, m_recv_buffer.capacity());
 #endif
+
+			if (m_recv_buffer.max_receive() <= 0)
+			{
+				// the buffer has reached its limit, it's full, and the upper
+				// layer needs more data before it can consume any of it. We
+				// would never read from this socket again
+				disconnect(errors::packet_too_large, operation_t::bittorrent, peer_error);
+				return;
+			}
 		}
 
 		TORRENT_ASSERT(m_recv_buffer.pos_at_end());

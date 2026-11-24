@@ -668,13 +668,39 @@ mmap_storage::mmap_storage(
 			int ret = 0;
 			span<byte> file_range = handle->range().subspan(static_cast<std::ptrdiff_t>(file_offset));
 
+			auto const copy = [&] {
+				sig::try_signal([&] {
+					std::memcpy(const_cast<char*>(file_range.data()),
+						buf.data(),
+						static_cast<std::size_t>(buf.size()));
+				});
+			};
+
 			try
 			{
 				TORRENT_ASSERT(file_range.size() >= buf.size());
 
-				sig::try_signal([&]{
-					std::memcpy(const_cast<char*>(file_range.data()), buf.data(), static_cast<std::size_t>(buf.size()));
-					});
+#if TORRENT_HAVE_MMAP
+				try
+				{
+					copy();
+				}
+				catch (std::system_error const& err)
+				{
+					// m_file_created saves us from checking the file size on
+					// every open, so a file that was deleted or truncated since
+					// we created it is shorter than the mapping. Recover by
+					// resizing it. Retry even if it already had the right size,
+					// since another thread may have resized it concurrently. A
+					// genuine I/O error will fault again.
+					if (err.code() != std::error_code(sig::errors::bus))
+						throw;
+					handle->extend_to_mapping();
+					copy();
+				}
+#else
+				copy();
+#endif
 
 				if (flags & disk_interface::volatile_read)
 					handle->dont_need(file_range.first(buf.size()));
@@ -688,6 +714,14 @@ mmap_storage::mmap_storage(
 				ec.ec = translate_error(err.code(), true);
 				return -1;
 			}
+#if TORRENT_HAVE_MMAP
+			catch (storage_error const& se)
+			{
+				ec.ec = se.ec;
+				ec.operation = se.operation;
+				return -1;
+			}
+#endif
 			catch (std::exception const& e)
 			{
 				TORRENT_UNUSED(e);
@@ -954,8 +988,8 @@ mmap_storage::mmap_storage(
 		if (sett.get_bool(settings_pack::disk_disable_copy_on_write))
 			mode |= aux::open_mode::no_cow;
 
-		if (files().file_size(file) / default_block_size
-			<= sett.get_int(settings_pack::mmap_file_size_cutoff))
+		if (files().file_size(file)
+			< std::int64_t(sett.get_int(settings_pack::mmap_file_size_cutoff)) * default_block_size)
 			mode |= aux::open_mode::no_mmap;
 
 		// if we have a cache already, don't store the data twice by leaving it in the OS cache as well

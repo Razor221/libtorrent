@@ -73,12 +73,12 @@ fuzzer natpmp ;
 fuzzer base32decode ;
 fuzzer base32encode ;
 fuzzer base64encode ;
+fuzzer base64decode_i2p ;
 fuzzer escape_string ;
 fuzzer identify_client ;
 fuzzer lsd ;
 fuzzer gzip ;
 fuzzer verify_encoding ;
-fuzzer convert_to_native ;
 fuzzer convert_from_native ;
 fuzzer utf8_codepoint ;
 fuzzer http_parser ;
@@ -112,6 +112,7 @@ fuzzer pe_conn ;
 fuzzer ut_metadata ;
 fuzzer ut_pex ;
 fuzzer web_seed ;
+fuzzer ed25519 ;
 
 local LARGE_TARGETS =
 	torrent_info
@@ -143,6 +144,7 @@ local LARGE_TARGETS =
 	ut_metadata
 	ut_pex
 	web_seed
+	ed25519
 	;
 
 install stage : $(TARGETS) : <install-type>EXE <location>fuzzers ;

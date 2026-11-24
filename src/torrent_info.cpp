@@ -47,6 +47,8 @@ see LICENSE file.
 #include <iterator>
 #include <algorithm>
 #include <set>
+#include <map>
+#include <cstring>
 #include <ctime>
 #include <array>
 
@@ -528,9 +530,6 @@ namespace {
 			filename = { info_buffer + (p.string_offset() - info_offset)
 				, static_cast<std::size_t>(p.string_length())};
 
-			while (!filename.empty() && filename.front() == TORRENT_SEPARATOR)
-				filename.remove_prefix(1);
-
 			aux::sanitize_append_path_element(path, p.string_value());
 			if (path.empty())
 			{
@@ -559,10 +558,8 @@ namespace {
 					bdecode_node const e = p.list_at(i);
 					if (i == end - 1)
 					{
-						filename = {info_buffer + (e.string_offset() - info_offset)
-							, static_cast<std::size_t>(e.string_length()) };
-						while (!filename.empty() && filename.front() == TORRENT_SEPARATOR)
-							filename.remove_prefix(1);
+						filename = {info_buffer + (e.string_offset() - info_offset),
+							static_cast<std::size_t>(e.string_length())};
 					}
 					aux::sanitize_append_path_element(path, e.string_value(), true);
 				}
@@ -630,8 +627,7 @@ namespace {
 			// directory we haven't parsed yet
 		}
 
-		if (filename.size() > path.length()
-			|| path.substr(path.size() - filename.size()) != filename)
+		if (rsplit_path(path).second != filename)
 		{
 			// if the filename was sanitized and differ, clear it to just use path
 			filename = {};
@@ -692,10 +688,8 @@ namespace {
 				return false;
 			}
 
-			string_view filename = { info_buffer + (e.first.string_offset() - info_offset)
-				, static_cast<size_t>(e.first.string_length()) };
-			while (!filename.empty() && filename.front() == TORRENT_SEPARATOR)
-				filename.remove_prefix(1);
+			string_view filename = {info_buffer + (e.first.string_offset() - info_offset),
+				static_cast<size_t>(e.first.string_length())};
 
 			bool const leaf_node = e.second.dict_size() == 1 && e.second.dict_at(0).first.empty();
 			bool const single_file = leaf_node && !is_multi_file && frame.tree.dict_size() == 1;
@@ -705,8 +699,7 @@ namespace {
 
 			if (leaf_node)
 			{
-				if (filename.size() > path.length()
-					|| path.substr(path.size() - filename.size()) != filename)
+				if (rsplit_path(path).second != filename)
 				{
 					// if the filename was sanitized and differ, clear it to just use path
 					filename = {};
@@ -1281,6 +1274,38 @@ TORRENT_VERSION_NAMESPACE_4
 				m_flags |= multifile;
 			else
 				m_flags &= ~multifile;
+
+			// files that share a "pieces root" are treated as identical, and
+			// share hashes. BEP 52 doesn't distinguish leaf hashes from interior
+			// nodes, so a 64 byte file containing the two children of another
+			// file's root has the same root, despite different content. Such
+			// torrents are deliberately rejected. They have no legitimate use
+			std::vector<file_index_t> with_root;
+			with_root.reserve(std::size_t(files.num_files()));
+			for (file_index_t const i : files.file_range())
+				if (files.root_ptr(i) != nullptr)
+					with_root.push_back(i);
+
+			auto const cmp_root = [&files](file_index_t const lhs, file_index_t const rhs) {
+				return std::memcmp(files.root_ptr(lhs), files.root_ptr(rhs), sha256_hash::size());
+			};
+			std::sort(with_root.begin(),
+				with_root.end(),
+				[&](file_index_t const lhs, file_index_t const rhs) {
+					return cmp_root(lhs, rhs) < 0;
+				});
+			auto const conflict = std::adjacent_find(with_root.begin(),
+				with_root.end(),
+				[&](file_index_t const lhs, file_index_t const rhs) {
+					return cmp_root(lhs, rhs) == 0 && files.file_size(lhs) != files.file_size(rhs);
+				});
+			if (conflict != with_root.end())
+			{
+				// mark the torrent as invalid
+				m_files.set_piece_length(0);
+				ec = errors::torrent_inconsistent_file_roots;
+				return;
+			}
 		}
 		else if (version >= 2)
 		{

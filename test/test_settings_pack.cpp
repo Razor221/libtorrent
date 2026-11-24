@@ -113,6 +113,8 @@ TORRENT_TEST(test_name)
 	TEST_NAME(predictive_piece_announce);
 	TEST_NAME(max_metadata_size);
 	TEST_NAME(num_optimistic_unchoke_slots);
+	TEST_NAME(announce_to_all_tiers);
+	TEST_NAME(announce_to_all_trackers);
 
 	TEST_EQUAL(name_for_setting(settings_pack::peer_tos), std::string("peer_dscp"));
 	TEST_EQUAL(setting_by_name("peer_tos"), settings_pack::peer_dscp); \
@@ -171,7 +173,7 @@ TORRENT_TEST(clear_single_string)
 	sp.clear(settings_pack::user_agent);
 
 	// when cleared, we'll get the default value
-	TEST_EQUAL(sp.get_str(settings_pack::user_agent), "libtorrent/2.1.2.0");
+	TEST_EQUAL(sp.get_str(settings_pack::user_agent), "libtorrent/2.1.3.0");
 }
 
 TORRENT_TEST(duplicates)

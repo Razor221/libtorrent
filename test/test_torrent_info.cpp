@@ -31,6 +31,7 @@ see LICENSE file.
 #include "libtorrent/session.hpp"
 #include "libtorrent/alert_types.hpp"
 
+#include <array>
 #include <iostream>
 
 using namespace lt;
@@ -427,50 +428,51 @@ struct test_failing_torrent_t
 	error_code error; // the expected error
 };
 
-test_failing_torrent_t test_error_torrents[] =
-{
-	{ "missing_piece_len.torrent", errors::torrent_missing_piece_length },
-	{ "invalid_piece_len.torrent", errors::torrent_missing_piece_length },
-	{ "negative_piece_len.torrent", errors::torrent_missing_piece_length },
-	{ "no_name.torrent", errors::torrent_missing_name },
-	{ "bad_name.torrent", errors::torrent_missing_name },
-	{ "invalid_name.torrent", errors::torrent_missing_name },
-	{ "invalid_info.torrent", errors::torrent_missing_info },
-	{ "string.torrent", errors::torrent_is_no_dict },
-	{ "negative_size.torrent", errors::torrent_invalid_length },
-	{ "negative_file_size.torrent", errors::torrent_invalid_length },
-	{ "invalid_path_list.torrent", errors::torrent_invalid_name},
-	{ "missing_path_list.torrent", errors::torrent_missing_name },
-	{ "invalid_pieces.torrent", errors::torrent_missing_pieces },
-	{ "unaligned_pieces.torrent", errors::torrent_invalid_hashes },
-	{ "invalid_file_size.torrent", errors::torrent_invalid_length },
-	{ "invalid_symlink.torrent", errors::torrent_invalid_name },
-	{ "many_pieces.torrent", errors::too_many_pieces_in_torrent },
-	{ "no_files.torrent", errors::no_files_in_torrent},
-	{ "zero.torrent", errors::torrent_invalid_length},
-	{ "zero2.torrent", errors::torrent_invalid_length},
-	{ "v2_mismatching_metadata.torrent", errors::torrent_inconsistent_files},
-	{ "v2_no_power2_piece.torrent", errors::torrent_missing_piece_length},
-	{ "v2_invalid_file.torrent", errors::torrent_file_parse_failed},
-	{ "v2_deep_recursion.torrent", bdecode_errors::depth_exceeded},
-	{ "v2_non_multiple_piece_layer.torrent", errors::torrent_invalid_piece_layer},
-	{ "v2_piece_layer_invalid_file_hash.torrent", errors::torrent_invalid_piece_layer},
-	{ "v2_invalid_piece_layer.torrent", errors::torrent_invalid_piece_layer},
-	{ "v2_invalid_piece_layer_root.torrent", errors::torrent_invalid_piece_layer},
-	{ "v2_unknown_piece_layer_entry.torrent", errors::torrent_invalid_piece_layer},
-	{ "v2_invalid_piece_layer_size.torrent", errors::torrent_invalid_piece_layer},
-	{ "v2_bad_file_alignment.torrent", errors::torrent_inconsistent_files},
-	{ "v2_unordered_files.torrent", errors::invalid_bencoding},
-	{ "v2_overlong_integer.torrent", errors::invalid_bencoding},
-	{ "v2_missing_file_root_invalid_symlink.torrent", errors::torrent_missing_pieces_root},
-	{ "v2_large_file.torrent", errors::torrent_invalid_length},
-	{ "v2_large_offset.torrent", errors::too_many_pieces_in_torrent},
-	{ "v2_piece_size.torrent", errors::torrent_missing_piece_length},
-	{ "v2_invalid_pad_file.torrent", errors::torrent_invalid_pad_file},
-	{ "v2_zero_root.torrent", errors::torrent_missing_pieces_root},
-	{ "v2_zero_root_small.torrent", errors::torrent_missing_pieces_root},
-	{ "v2_empty_filename.torrent", errors::torrent_file_parse_failed},
-	{ "duplicate_files2.torrent", errors::too_many_duplicate_filenames},
+test_failing_torrent_t test_error_torrents[] = {
+	{"missing_piece_len.torrent", errors::torrent_missing_piece_length},
+	{"invalid_piece_len.torrent", errors::torrent_missing_piece_length},
+	{"negative_piece_len.torrent", errors::torrent_missing_piece_length},
+	{"no_name.torrent", errors::torrent_missing_name},
+	{"bad_name.torrent", errors::torrent_missing_name},
+	{"invalid_name.torrent", errors::torrent_missing_name},
+	{"invalid_info.torrent", errors::torrent_missing_info},
+	{"string.torrent", errors::torrent_is_no_dict},
+	{"negative_size.torrent", errors::torrent_invalid_length},
+	{"negative_file_size.torrent", errors::torrent_invalid_length},
+	{"invalid_path_list.torrent", errors::torrent_invalid_name},
+	{"missing_path_list.torrent", errors::torrent_missing_name},
+	{"invalid_pieces.torrent", errors::torrent_missing_pieces},
+	{"unaligned_pieces.torrent", errors::torrent_invalid_hashes},
+	{"invalid_file_size.torrent", errors::torrent_invalid_length},
+	{"invalid_symlink.torrent", errors::torrent_invalid_name},
+	{"many_pieces.torrent", errors::too_many_pieces_in_torrent},
+	{"no_files.torrent", errors::no_files_in_torrent},
+	{"zero.torrent", errors::torrent_invalid_length},
+	{"zero2.torrent", errors::torrent_invalid_length},
+	{"v2_mismatching_metadata.torrent", errors::torrent_inconsistent_files},
+	{"v2_no_power2_piece.torrent", errors::torrent_missing_piece_length},
+	{"v2_invalid_file.torrent", errors::torrent_file_parse_failed},
+	{"v2_deep_recursion.torrent", bdecode_errors::depth_exceeded},
+	{"v2_non_multiple_piece_layer.torrent", errors::torrent_invalid_piece_layer},
+	{"v2_piece_layer_invalid_file_hash.torrent", errors::torrent_invalid_piece_layer},
+	{"v2_invalid_piece_layer.torrent", errors::torrent_invalid_piece_layer},
+	{"v2_invalid_piece_layer_root.torrent", errors::torrent_invalid_piece_layer},
+	{"v2_unknown_piece_layer_entry.torrent", errors::torrent_invalid_piece_layer},
+	{"v2_invalid_piece_layer_size.torrent", errors::torrent_invalid_piece_layer},
+	{"v2_same_root_single_piece.torrent", errors::torrent_inconsistent_file_roots},
+	{"v2_same_root_multi_piece.torrent", errors::torrent_inconsistent_file_roots},
+	{"v2_bad_file_alignment.torrent", errors::torrent_inconsistent_files},
+	{"v2_unordered_files.torrent", errors::invalid_bencoding},
+	{"v2_overlong_integer.torrent", errors::invalid_bencoding},
+	{"v2_missing_file_root_invalid_symlink.torrent", errors::torrent_missing_pieces_root},
+	{"v2_large_file.torrent", errors::torrent_invalid_length},
+	{"v2_large_offset.torrent", errors::too_many_pieces_in_torrent},
+	{"v2_piece_size.torrent", errors::torrent_missing_piece_length},
+	{"v2_invalid_pad_file.torrent", errors::torrent_invalid_pad_file},
+	{"v2_zero_root.torrent", errors::torrent_missing_pieces_root},
+	{"v2_zero_root_small.torrent", errors::torrent_missing_pieces_root},
+	{"v2_empty_filename.torrent", errors::torrent_file_parse_failed},
+	{"duplicate_files2.torrent", errors::too_many_duplicate_filenames},
 };
 
 } // anonymous namespace
@@ -1887,6 +1889,121 @@ TORRENT_TEST(empty_file2)
 	}
 }
 
+namespace {
+entry::list_type deep_path(int const depth)
+{
+	entry::list_type path;
+	for (int i = 0; i < depth; ++i)
+		path.emplace_back("d");
+	path.emplace_back("file");
+	return path;
+}
+
+error_code load_torrent(entry const& info)
+{
+	entry torrent;
+	torrent["info"] = info;
+	std::vector<char> const buf = bencode(torrent);
+
+	error_code ec;
+	load_torrent_buffer(buf, ec, load_torrent_limits{});
+	return ec;
+}
+
+entry v1_info(char const* name_key, entry::list_type files)
+{
+	entry info;
+	info[name_key] = "test";
+	info["piece length"] = 16384;
+	info["pieces"] = std::string(20, '\0');
+	info["files"] = std::move(files);
+	return info;
+}
+
+error_code load_v1_with_path_depth(char const* name_key, char const* path_key, int const depth)
+{
+	entry file;
+	file["length"] = 1;
+	file[path_key] = deep_path(depth);
+	return load_torrent(v1_info(name_key, {file}));
+}
+
+error_code load_v1_with_symlink_depth(char const* name_key, int const depth)
+{
+	entry file;
+	file["length"] = 1;
+	file["path"] = entry::list_type{entry("file")};
+
+	entry link;
+	link["length"] = 0;
+	link["attr"] = "l";
+	link["path"] = entry::list_type{entry("link")};
+	link["symlink path"] = deep_path(depth);
+	return load_torrent(v1_info(name_key, {file, link}));
+}
+
+error_code load_v2_with_symlink_depth(char const* name_key, int const depth)
+{
+	entry info;
+	info[name_key] = "test";
+	info["piece length"] = 16384;
+	info["meta version"] = 2;
+	auto& file = info["file tree"]["file"][""];
+	file["length"] = 1;
+	file["pieces root"] = std::string(32, '\x01');
+	auto& link = info["file tree"]["link"][""];
+	link["length"] = 0;
+	link["attr"] = "l";
+	link["symlink path"] = deep_path(depth);
+	return load_torrent(info);
+}
+
+std::array<char const*, 2> const name_keys{{"name", "name.utf-8"}};
+}
+
+TORRENT_TEST(v1_directory_depth)
+{
+	for (char const* name_key : name_keys)
+	{
+		for (char const* path_key : {"path", "path.utf-8"})
+		{
+			TEST_EQUAL(load_v1_with_path_depth(name_key, path_key, 99), error_code());
+			TEST_EQUAL(load_v1_with_path_depth(name_key, path_key, 100),
+				error_code(errors::torrent_directory_too_deep));
+		}
+	}
+}
+
+// the limit applies to path.utf-8 when present, regardless of path
+TORRENT_TEST(v1_directory_depth_utf8_preferred)
+{
+	entry deep;
+	deep["length"] = 1;
+	deep["path"] = deep_path(1);
+	deep["path.utf-8"] = deep_path(100);
+	TEST_EQUAL(
+		load_torrent(v1_info("name", {deep})), error_code(errors::torrent_directory_too_deep));
+
+	entry shallow;
+	shallow["length"] = 1;
+	shallow["path"] = deep_path(100);
+	shallow["path.utf-8"] = deep_path(1);
+	TEST_EQUAL(load_torrent(v1_info("name", {shallow})), error_code());
+}
+
+TORRENT_TEST(symlink_directory_depth)
+{
+	for (char const* name_key : name_keys)
+	{
+		TEST_EQUAL(load_v1_with_symlink_depth(name_key, 99), error_code());
+		TEST_EQUAL(load_v1_with_symlink_depth(name_key, 100),
+			error_code(errors::torrent_directory_too_deep));
+		TEST_EQUAL(load_v2_with_symlink_depth(name_key, 99), error_code());
+		TEST_EQUAL(load_v2_with_symlink_depth(name_key, 100),
+			error_code(errors::torrent_directory_too_deep));
+	}
+}
+
 TORRENT_TEST(load_torrent_empty_file)
 {
 	try
@@ -2063,6 +2180,7 @@ TORRENT_TEST(write_torrent_file_session_roundtrip)
 		"v2_multiple_files.torrent",
 		"v2_symlinks.torrent",
 		"v2_hybrid.torrent",
+		"v2_identical_files.torrent",
 		"empty-files-1.torrent",
 		"empty-files-2.torrent",
 		"empty-files-3.torrent",
@@ -2143,4 +2261,112 @@ TORRENT_TEST(write_torrent_file_session_roundtrip)
 			TEST_CHECK(out_buffer == data);
 		}
 	}
+}
+
+namespace {
+
+add_torrent_params keep_merkle_trees(
+	add_torrent_params atp, std::initializer_list<file_index_t> const keep)
+{
+	for (file_index_t const f : atp.ti->layout().file_range())
+	{
+		if (std::find(keep.begin(), keep.end(), f) != keep.end())
+			continue;
+		atp.merkle_trees[f].clear();
+		if (f < atp.merkle_tree_mask.end_index())
+			atp.merkle_tree_mask[f].clear();
+	}
+	return atp;
+}
+
+add_torrent_params load_test_torrent(char const* name, std::vector<char>& data)
+{
+	std::string const filename =
+		combine_path(combine_path(parent_path(current_working_directory()), "test_torrents"), name);
+	error_code ec;
+	TEST_CHECK(load_file(filename, data, ec) == 0);
+	TEST_CHECK(!ec);
+	return load_torrent_buffer(data);
+}
+
+}
+
+// files with identical content have the same "pieces root", and share a single
+// entry in "piece layers". It must be written once. Without
+// allow_missing_piece_layer, the first of them must have a complete merkle tree
+TORRENT_TEST(write_torrent_file_identical_files)
+{
+	std::vector<char> data;
+	add_torrent_params const atp = load_test_torrent("v2_identical_files.torrent", data);
+	file_storage const& fs = atp.ti->layout();
+	TEST_EQUAL(fs.num_files(), 3);
+	TEST_CHECK(fs.root(0_file) == fs.root(1_file));
+	TEST_CHECK(fs.root(0_file) == fs.root(2_file));
+
+	auto const write = [&](std::initializer_list<file_index_t> const keep,
+						   write_torrent_flags_t const flags) {
+		return write_torrent_file_buf(keep_merkle_trees(atp, keep), flags);
+	};
+
+	auto const allow = write_flags::allow_missing_piece_layer;
+
+	TEST_CHECK(write_torrent_file_buf(atp, {}) == data);
+	TEST_CHECK(write_torrent_file_buf(atp, allow) == data);
+
+	TEST_CHECK(write({0_file}, {}) == data);
+	TEST_CHECK(write({0_file, 1_file}, {}) == data);
+	TEST_CHECK(write({0_file, 2_file}, {}) == data);
+	TEST_THROW(write({1_file}, {}));
+	TEST_THROW(write({2_file}, {}));
+	TEST_THROW(write({1_file, 2_file}, {}));
+	TEST_THROW(write({}, {}));
+
+	TEST_CHECK(write({0_file}, allow) == data);
+	TEST_CHECK(write({1_file}, allow) == data);
+	TEST_CHECK(write({2_file}, allow) == data);
+	TEST_CHECK(write({1_file, 2_file}, allow) == data);
+
+	entry const e = write_torrent_file(keep_merkle_trees(atp, {}), allow);
+	TEST_CHECK(e["piece layers"].dict().empty());
+}
+
+// with allow_missing_piece_layer, a file without a complete merkle tree is left
+// out of "piece layers", without affecting the other files
+TORRENT_TEST(write_torrent_file_incomplete_tree)
+{
+	std::vector<char> data;
+	add_torrent_params const atp = load_test_torrent("v2_multiple_files.torrent", data);
+	file_storage const& fs = atp.ti->layout();
+	std::vector<file_index_t> files;
+	for (file_index_t const f : fs.file_range())
+		if (!fs.pad_file_at(f))
+			files.push_back(f);
+	TEST_EQUAL(files.size(), 3);
+	file_index_t const f0 = files[0];
+	file_index_t const f1 = files[1];
+	file_index_t const f2 = files[2];
+	TEST_CHECK(fs.root(f0) != fs.root(f1));
+	TEST_CHECK(fs.root(f1) != fs.root(f2));
+
+	TEST_CHECK(write_torrent_file_buf(atp, {}) == data);
+
+	auto const partial = keep_merkle_trees(atp, {f0, f2});
+	TEST_THROW(write_torrent_file(partial, {}));
+
+	entry const full = write_torrent_file(atp, {});
+	entry const e = write_torrent_file(partial, write_flags::allow_missing_piece_layer);
+	auto const& layers = e["piece layers"].dict();
+	TEST_EQUAL(layers.size(), 2);
+	TEST_CHECK(layers.find(fs.root(f1).to_string()) == layers.end());
+	for (file_index_t const f : {f0, f2})
+	{
+		std::string const root = fs.root(f).to_string();
+		TEST_CHECK(layers.find(root) != layers.end());
+		TEST_CHECK(e["piece layers"][root] == full["piece layers"][root]);
+	}
+
+	entry const none =
+		write_torrent_file(keep_merkle_trees(atp, {}), write_flags::allow_missing_piece_layer);
+	TEST_CHECK(none["piece layers"].dict().empty());
+	TEST_CHECK(none["info"] == full["info"]);
 }

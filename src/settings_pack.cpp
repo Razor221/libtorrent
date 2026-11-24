@@ -124,7 +124,7 @@ namespace {
 		SET(proxy_username, "", &session_impl::update_proxy),
 		SET(proxy_password, "", &session_impl::update_proxy),
 		SET(i2p_hostname, "", &session_impl::update_i2p_bridge),
-		SET(peer_fingerprint, "-LT2120-", nullptr),
+		SET(peer_fingerprint, "-LT2130-", nullptr),
 		SET(dht_bootstrap_nodes, "dht.libtorrent.org:25401", &session_impl::update_dht_bootstrap_nodes),
 		SET(natpmp_gateway, "", nullptr),
 		SET(webtorrent_stun_server, "stun.l.google.com:19302", nullptr)
@@ -150,8 +150,8 @@ namespace {
 		SET(close_redundant_connections, true, nullptr),
 		SET(prioritize_partial_pieces, false, nullptr),
 		SET(rate_limit_ip_overhead, true, nullptr),
-		SET(announce_to_all_trackers, false, nullptr),
 		SET(announce_to_all_tiers, false, nullptr),
+		SET(announce_to_all_trackers, false, nullptr),
 		SET(prefer_udp_trackers, true, nullptr),
 		DEPRECATED_SET(strict_super_seeding, false, nullptr),
 		DEPRECATED_SET(lock_disk_cache, false, nullptr),

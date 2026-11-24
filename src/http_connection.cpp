@@ -46,6 +46,9 @@ namespace libtorrent::aux {
 
 namespace {
 
+// redirects to URLs longer than this are rejected
+constexpr std::size_t max_redirect_url_size = 4096;
+
 // true when an HTTP-type proxy is expected to resolve "hostname" itself,
 // via the hostname embedded in the CONNECT request. This only applies to
 // SSL; the plaintext case doesn't use a CONNECT tunnel at all, so the
@@ -58,15 +61,16 @@ bool proxy_hostname_via_http_connect(aux::proxy_settings const& ps, bool const s
 
 }
 
-http_connection::http_connection(io_context& ios
-	, aux::resolver_interface& resolver
-	, http_handler handler
-	, int max_bottled_buffer_size
-	, http_connect_handler ch
-	, http_filter_handler fh
-	, hostname_filter_handler hfh
+http_connection::http_connection(io_context& ios,
+	aux::resolver_interface& resolver,
+	http_handler handler,
+	int max_bottled_buffer_size,
+	http_connect_handler ch,
+	http_filter_handler fh,
+	hostname_filter_handler hfh
 #if TORRENT_USE_SSL
-	, ssl::context* ssl_ctx
+	,
+	ssl::context* ssl_ctx
 #endif
 	)
 	: m_ios(ios)
@@ -84,14 +88,11 @@ http_connection::http_connection(io_context& ios
 	, m_hostname_filter_handler(std::move(hfh))
 	, m_timer(ios)
 	, m_completion_timeout(seconds(5))
-	, m_limiter_timer(ios)
 	, m_last_receive(aux::time_now())
 	, m_start_time(aux::time_now())
 	, m_read_pos(0)
 	, m_redirects(5)
 	, m_max_bottled_buffer_size(max_bottled_buffer_size)
-	, m_rate_limit(0)
-	, m_download_quota(0)
 	, m_port(0)
 {
 	TORRENT_ASSERT(m_handler);
@@ -156,13 +157,27 @@ void http_connection::get(std::string const& url, time_duration timeout
 
 	bool const ssl = (protocol == "https");
 
+#if TORRENT_USE_I2P
+	// Keep .i2p requests on SAM, not the configured HTTP proxy.
+	bool const i2p = is_i2p_url(url);
+	if (i2p && i2p_conn == nullptr)
+	{
+		post(m_ios,
+			std::bind(
+				&http_connection::callback, me, error_code(errors::no_i2p_router), span<char>{}));
+		return;
+	}
+#endif
+
 	std::stringstream request;
 
 	// exclude ssl here, because SSL assumes CONNECT support in the
 	// proxy and is handled at the lower layer
-	if (ps && (ps->type == settings_pack::http
-		|| ps->type == settings_pack::http_pw)
-		&& !ssl)
+	if (ps && (ps->type == settings_pack::http || ps->type == settings_pack::http_pw) && !ssl
+#if TORRENT_USE_I2P
+		&& !i2p
+#endif
+	)
 	{
 		// if we're using an http proxy and not an ssl
 		// connection, just do a regular http proxy request
@@ -216,6 +231,7 @@ void http_connection::start(std::string const& hostname, int port
 	)
 {
 	m_redirects = handle_redirects;
+	m_max_redirects = handle_redirects;
 	m_resolve_flags = resolve_flags;
 	if (ps) m_proxy = *ps;
 
@@ -229,6 +245,7 @@ void http_connection::start(std::string const& hostname, int port
 	m_timer.async_wait(std::bind(&http_connection::on_timeout
 		, std::weak_ptr<http_connection>(me), _1));
 	m_called = false;
+	m_failover = false;
 	m_parser.reset();
 	m_recvbuffer.clear();
 	m_read_pos = 0;
@@ -241,6 +258,7 @@ void http_connection::start(std::string const& hostname, int port
 		&& m_ssl == ssl && m_bind_addr == bind_addr)
 	{
 		ADD_OUTSTANDING_ASYNC("http_connection::on_write");
+		socket_op_started();
 		async_write(*m_sock, boost::asio::buffer(m_sendbuffer)
 			, std::bind(&http_connection::on_write, me, _1));
 	}
@@ -288,41 +306,10 @@ void http_connection::start(std::string const& hostname, int port
 		{
 			proxy = nullptr;
 		}
-		aux::proxy_settings null_proxy;
-
-		void* userdata = nullptr;
-#if TORRENT_USE_SSL
-		if (m_ssl)
-		{
-			TORRENT_ASSERT(m_ssl_ctx != nullptr);
-			userdata = m_ssl_ctx;
-		}
-#endif
-		// assume this is not a tracker connection. Tracker connections that
-		// shouldn't be subject to the proxy should pass in nullptr as the proxy
-		// pointer.
-		m_sock.emplace(instantiate_connection(m_ios
-			, proxy ? *proxy : null_proxy, userdata, nullptr, false, false));
-
-		if (m_bind_addr)
-		{
-			error_code ec;
-			m_sock->open(m_bind_addr->ip.is_v4() ? tcp::v4() : tcp::v6(), ec);
-#if TORRENT_HAS_BINDTODEVICE
-			error_code ignore;
-			bind_device(*m_sock, m_bind_addr->device.c_str(), ignore);
-#endif
-			m_sock->bind(tcp::endpoint(m_bind_addr->ip, 0), ec);
-			if (ec)
-			{
-				post(m_ios, std::bind(&http_connection::callback
-					, me, ec, span<char>{}));
-				return;
-			}
-		}
+		m_sock_proxy = proxy ? *proxy : aux::proxy_settings{};
 
 		error_code ec;
-		setup_ssl_hostname(*m_sock, hostname, ec);
+		create_socket(hostname, ec);
 		if (ec)
 		{
 			post(m_ios, std::bind(&http_connection::callback
@@ -396,13 +383,13 @@ void http_connection::on_timeout(std::weak_ptr<http_connection> p
 	if (c->m_start_time + c->m_completion_timeout <= now)
 	{
 		// the connection timed out. If we have more endpoints to try, just
-		// close this connection. The on_connect handler will try the next
-		// endpoint in the list.
+		// close this connection. The completion handler of the outstanding
+		// operation will try the next endpoint in the list.
 		if (c->m_next_ep < int(c->m_endpoints.size()))
 		{
 			error_code ec;
 			c->m_sock->close(ec);
-			if (!c->m_connecting) c->connect();
+			c->m_failover = true;
 			c->m_last_receive = now;
 			c->m_start_time = c->m_last_receive;
 		}
@@ -420,6 +407,81 @@ void http_connection::on_timeout(std::weak_ptr<http_connection> p
 	ADD_OUTSTANDING_ASYNC("http_connection::on_timeout");
 	c->m_timer.expires_at(c->m_start_time + c->m_completion_timeout);
 	c->m_timer.async_wait(std::bind(&http_connection::on_timeout, p, _1));
+}
+
+void http_connection::create_socket(std::string const& hostname, error_code& ec)
+{
+	void* userdata = nullptr;
+#if TORRENT_USE_SSL
+	if (m_ssl)
+	{
+		TORRENT_ASSERT(m_ssl_ctx != nullptr);
+		userdata = m_ssl_ctx;
+	}
+#endif
+	if (m_sock)
+	{
+		// we may be called from a completion handler of the old socket, and
+		// its stream layers (SSL, proxies) may still touch it after the
+		// handler returns
+		post(m_ios, [s = std::move(m_sock)] {});
+	}
+	// assume this is not a tracker connection. Tracker connections that
+	// shouldn't be subject to the proxy should pass in nullptr as the proxy
+	// pointer.
+	m_sock = std::make_unique<aux::socket_type>(
+		instantiate_connection(m_ios, m_sock_proxy, userdata, nullptr, false, false));
+
+	if (m_bind_addr)
+	{
+		m_sock->open(m_bind_addr->ip.is_v4() ? tcp::v4() : tcp::v6(), ec);
+#if TORRENT_HAS_BINDTODEVICE
+		error_code ignore;
+		bind_device(*m_sock, m_bind_addr->device.c_str(), ignore);
+#endif
+		m_sock->bind(tcp::endpoint(m_bind_addr->ip, 0), ec);
+		if (ec)
+			return;
+	}
+
+	setup_ssl_hostname(*m_sock, hostname, ec);
+}
+
+void http_connection::socket_op_started()
+{
+#if TORRENT_USE_ASSERTS
+	// failover replaces the socket from the completion handler of the one
+	// outstanding operation, which is only safe if there is no other
+	TORRENT_ASSERT(m_socket_ops == 0);
+	++m_socket_ops;
+#endif
+}
+
+void http_connection::socket_op_completed()
+{
+#if TORRENT_USE_ASSERTS
+	TORRENT_ASSERT(m_socket_ops == 1);
+	--m_socket_ops;
+#endif
+}
+
+void http_connection::reconnect()
+{
+	TORRENT_ASSERT(m_socket_ops == 0);
+	if (m_abort)
+		return;
+
+	// the socket and its stream layers (SSL session, proxy handshake) carry
+	// state from the previous endpoint, start the next one from scratch
+	m_failover = false;
+	error_code ec;
+	create_socket(m_hostname, ec);
+	if (ec)
+	{
+		callback(ec);
+		return;
+	}
+	connect();
 }
 
 void http_connection::close(bool force)
@@ -442,8 +504,6 @@ void http_connection::close(bool force)
 	else
 		m_timer.cancel();
 
-	m_limiter_timer.cancel();
-
 	m_hostname.clear();
 	m_port = 0;
 	m_handler = nullptr;
@@ -463,6 +523,7 @@ void http_connection::connect_i2p_tracker(char const* destination)
 	ADD_OUTSTANDING_ASYNC("http_connection::on_connect");
 	TORRENT_ASSERT(!m_connecting);
 	m_connecting = true;
+	socket_op_started();
 	m_sock->async_connect(tcp::endpoint(), std::bind(&http_connection::on_connect
 		, shared_from_this(), _1));
 }
@@ -532,6 +593,12 @@ void http_connection::connect()
 {
 	TORRENT_ASSERT(m_next_ep < int(m_endpoints.size()));
 
+	// a previous endpoint may have timed out part-way through a response
+	m_parser.reset();
+	m_recvbuffer.clear();
+	m_read_pos = 0;
+	m_redirects = m_max_redirects;
+
 	std::shared_ptr<http_connection> me(shared_from_this());
 
 	if (m_proxy.proxy_hostnames
@@ -595,6 +662,7 @@ void http_connection::connect()
 	ADD_OUTSTANDING_ASYNC("http_connection::on_connect");
 	TORRENT_ASSERT(!m_connecting);
 	m_connecting = true;
+	socket_op_started();
 	m_sock->async_connect(target_address, std::bind(&http_connection::on_connect
 		, me, _1));
 }
@@ -602,15 +670,24 @@ void http_connection::connect()
 void http_connection::on_connect(error_code const& e)
 {
 	COMPLETE_ASYNC("http_connection::on_connect");
+	socket_op_completed();
 	TORRENT_ASSERT(m_connecting);
 	m_connecting = false;
 
 	m_last_receive = clock_type::now();
 	m_start_time = m_last_receive;
+
+	if (m_failover)
+	{
+		reconnect();
+		return;
+	}
+
 	if (!e)
 	{
 		if (m_connect_handler) m_connect_handler(*this);
 		ADD_OUTSTANDING_ASYNC("http_connection::on_write");
+		socket_op_started();
 		async_write(*m_sock, boost::asio::buffer(m_sendbuffer)
 			, std::bind(&http_connection::on_write, shared_from_this(), _1));
 	}
@@ -619,7 +696,7 @@ void http_connection::on_connect(error_code const& e)
 		// The connection failed. Try the next endpoint in the list.
 		error_code ec;
 		m_sock->close(ec);
-		connect();
+		reconnect();
 	}
 	else
 	{
@@ -646,6 +723,9 @@ void http_connection::callback(error_code e, span<char> data)
 
 			if (ec)
 			{
+				// regardless of m_handler, or on_timeout would keep acting on this request
+				m_called = true;
+				m_timer.cancel();
 				if (m_handler) m_handler(ec, m_parser, data, *this);
 				return;
 			}
@@ -665,6 +745,13 @@ void http_connection::callback(error_code e, span<char> data)
 void http_connection::on_write(error_code const& e)
 {
 	COMPLETE_ASYNC("http_connection::on_write");
+	socket_op_completed();
+
+	if (m_failover)
+	{
+		reconnect();
+		return;
+	}
 
 	if (e == boost::asio::error::operation_aborted) return;
 
@@ -676,24 +763,21 @@ void http_connection::on_write(error_code const& e)
 
 	if (m_abort) return;
 
-	std::string().swap(m_sendbuffer);
+	// hold on to m_sendbuffer. If this endpoint times out, the request is sent
+	// again to the next one
 	m_recvbuffer.resize(4096);
 
 	int amount_to_read = int(m_recvbuffer.size()) - m_read_pos;
-	if (m_rate_limit > 0 && amount_to_read > m_download_quota)
+	if (amount_to_read <= 0)
 	{
-		amount_to_read = m_download_quota;
-		if (m_download_quota == 0)
-		{
-			if (!m_limiter_timer_active)
-			{
-				ADD_OUTSTANDING_ASYNC("http_connection::on_assign_bandwidth");
-				on_assign_bandwidth(error_code());
-			}
-			return;
-		}
+		// whatever state m_read_pos was left in, never read past the end of
+		// m_recvbuffer
+		TORRENT_ASSERT_FAIL();
+		callback(error_code(boost::system::errc::no_buffer_space, generic_category()));
+		return;
 	}
 	ADD_OUTSTANDING_ASYNC("http_connection::on_read");
+	socket_op_started();
 	m_sock->async_read_some(boost::asio::buffer(m_recvbuffer.data() + m_read_pos
 		, std::size_t(amount_to_read))
 		, std::bind(&http_connection::on_read
@@ -704,11 +788,12 @@ void http_connection::on_read(error_code const& e
 	, std::size_t bytes_transferred)
 {
 	COMPLETE_ASYNC("http_connection::on_read");
+	socket_op_completed();
 
-	if (m_rate_limit)
+	if (m_failover)
 	{
-		m_download_quota -= int(bytes_transferred);
-		TORRENT_ASSERT(m_download_quota >= 0);
+		reconnect();
+		return;
 	}
 
 	if (e == boost::asio::error::operation_aborted) return;
@@ -780,6 +865,19 @@ void http_connection::on_read(error_code const& e
 			m_sock->close(ec);
 
 			std::string url = aux::resolve_redirect_location(m_url, location);
+			if (url.size() > max_redirect_url_size)
+			{
+				callback(error_code(errors::invalid_redirection));
+				return;
+			}
+
+#if TORRENT_USE_I2P
+			if (m_i2p_conn && !aux::is_i2p_url(url))
+			{
+				callback(error_code(errors::invalid_redirection));
+				return;
+			}
+#endif
 
 			// Don't forward Authorization credentials to a different
 			// origin. The redirect target may be a third party server
@@ -817,7 +915,13 @@ void http_connection::on_read(error_code const& e
 
 	// if we've hit the limit, double the buffer size
 	if (int(m_recvbuffer.size()) == m_read_pos)
+	{
 		m_recvbuffer.resize(std::min(m_read_pos * 2, m_max_bottled_buffer_size));
+		// the parser refers to the receive buffer, which may just have been
+		// reallocated. Handlers may call get_body() on it if the connection
+		// is closed before the response is finished
+		m_parser.incoming(span<char const>(m_recvbuffer).first(m_read_pos), error);
+	}
 
 	if (m_read_pos == m_max_bottled_buffer_size)
 	{
@@ -827,77 +931,19 @@ void http_connection::on_read(error_code const& e
 		return;
 	}
 	int amount_to_read = int(m_recvbuffer.size()) - m_read_pos;
-	if (m_rate_limit > 0 && amount_to_read > m_download_quota)
+	if (amount_to_read <= 0)
 	{
-		amount_to_read = m_download_quota;
-		if (m_download_quota == 0)
-		{
-			if (!m_limiter_timer_active)
-			{
-				ADD_OUTSTANDING_ASYNC("http_connection::on_assign_bandwidth");
-				on_assign_bandwidth(error_code());
-			}
-			return;
-		}
-	}
-	ADD_OUTSTANDING_ASYNC("http_connection::on_read");
-	m_sock->async_read_some(boost::asio::buffer(m_recvbuffer.data() + m_read_pos
-		, std::size_t(amount_to_read))
-		, std::bind(&http_connection::on_read
-			, me, _1, _2));
-}
-
-void http_connection::on_assign_bandwidth(error_code const& e)
-{
-	COMPLETE_ASYNC("http_connection::on_assign_bandwidth");
-	if ((e == boost::asio::error::operation_aborted
-		&& m_limiter_timer_active)
-		|| !m_sock->is_open())
-	{
-		callback(boost::asio::error::eof);
+		// whatever state m_read_pos was left in, never read past the end of
+		// m_recvbuffer
+		TORRENT_ASSERT_FAIL();
+		callback(error_code(boost::system::errc::no_buffer_space, generic_category()));
 		return;
 	}
-	m_limiter_timer_active = false;
-	if (e) return;
-
-	if (m_abort) return;
-
-	if (m_download_quota > 0) return;
-
-	m_download_quota = m_rate_limit / 4;
-
-	int amount_to_read = int(m_recvbuffer.size()) - m_read_pos;
-	if (amount_to_read > m_download_quota)
-		amount_to_read = m_download_quota;
-
-	if (!m_sock->is_open()) return;
-
 	ADD_OUTSTANDING_ASYNC("http_connection::on_read");
-	m_sock->async_read_some(boost::asio::buffer(m_recvbuffer.data() + m_read_pos
-		, std::size_t(amount_to_read))
-		, std::bind(&http_connection::on_read
-			, shared_from_this(), _1, _2));
-
-	m_limiter_timer_active = true;
-	m_limiter_timer.expires_after(milliseconds(250));
-	ADD_OUTSTANDING_ASYNC("http_connection::on_assign_bandwidth");
-	m_limiter_timer.async_wait(std::bind(&http_connection::on_assign_bandwidth
-		, shared_from_this(), _1));
-}
-
-void http_connection::rate_limit(int limit)
-{
-	if (!m_sock->is_open()) return;
-
-	if (!m_limiter_timer_active)
-	{
-		m_limiter_timer_active = true;
-		m_limiter_timer.expires_after(milliseconds(250));
-		ADD_OUTSTANDING_ASYNC("http_connection::on_assign_bandwidth");
-		m_limiter_timer.async_wait(std::bind(&http_connection::on_assign_bandwidth
-			, shared_from_this(), _1));
-	}
-	m_rate_limit = limit;
+	socket_op_started();
+	m_sock->async_read_some(
+		boost::asio::buffer(m_recvbuffer.data() + m_read_pos, std::size_t(amount_to_read)),
+		std::bind(&http_connection::on_read, me, _1, _2));
 }
 
 }
